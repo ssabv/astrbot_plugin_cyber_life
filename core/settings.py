@@ -14,9 +14,20 @@ from typing import Any
 from .holidays import HolidayCalendar
 from .schedule import ACCESS_MODES, AutoSchedule, Phase
 from .util import atomic_write_json, read_json
+from .tieba_scope import normalize_forums
 
 
 DEFAULTS: dict[str, Any] = {
+    # Independent public-text writer; empty provider IDs follow the chat model.
+    "writer_enabled": False,
+    "writer_provider_id": "",
+    "writer_persona_id": "",
+    "writer_context_umo": "",
+    "writer_timeout": 180,
+    "writer_livingmemory_enabled": True,
+    "writer_memory_timeout": 15,
+    "analysis_provider_id": "",
+    "vision_provider_id": "",
     # master switches
     "enabled": True,
     "auto_run": True,
@@ -37,6 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "extra_workday_dates": [],
     "daily_watch_minutes": 60,
     "daily_watch_budget_is_total": True,
+    "browse_enabled": True,
     # commenting
     "comment_enabled": True,
     "comment_interval_min": 35,
@@ -51,6 +63,7 @@ DEFAULTS: dict[str, Any] = {
     "reply_max_chars": 60,
     # platforms / idle content
     "platforms": ["bilibili", "xiaoheihe", "tieba"],
+    "tieba_forums": [],
     "browse_interval_min": 12,
     "browse_interval_max": 35,
     "video_min_frames": 10,
@@ -95,6 +108,10 @@ DEFAULTS: dict[str, Any] = {
     "browser_viewport_width": 1100,
     "browser_viewport_height": 820,
     "login_timeout_seconds": 180,
+    # AI 识屏过验证码：截图给视觉模型，按识别结果填写或拖动
+    "captcha_auto_solve": True,
+    "captcha_max_attempts": 3,
+    "captcha_slider": True,
     # notifications
     "notify_umo": "",
     "notify_actions": False,
@@ -119,6 +136,8 @@ _ENUMS = {
 }
 
 _RANGES: dict[str, tuple[float, float]] = {
+    "writer_timeout": (10, 600),
+    "writer_memory_timeout": (1, 60),
     "comment_interval_min": (1, 1440),
     "comment_interval_max": (1, 2880),
     "reply_interval_min": (1, 1440),
@@ -147,16 +166,21 @@ _RANGES: dict[str, tuple[float, float]] = {
     "mood_decay_per_hour": (0, 2),
     "browser_timeout_seconds": (5, 300),
     "login_timeout_seconds": (30, 600),
+    "captcha_max_attempts": (1, 6),
     "browser_viewport_width": (640, 2560),
     "browser_viewport_height": (480, 1600),
     "keep_activity_days": (1, 365),
 }
 
 _BOOL_FIELDS = {key for key, value in DEFAULTS.items() if isinstance(value, bool)}
+MODEL_FIELDS = {key for key in DEFAULTS if key.startswith("writer_")} | {"analysis_provider_id", "vision_provider_id"}
+NATIVE_FIELDS = MODEL_FIELDS | {"tieba_forums"}
 
 
 def _coerce(key: str, value: Any) -> Any:
     default = DEFAULTS.get(key)
+    if key == "tieba_forums":
+        return normalize_forums(value)
     if key in _BOOL_FIELDS:
         return bool(value)
     if key in _RANGES:
@@ -199,6 +223,8 @@ class SettingsStore:
         if isinstance(stored, dict):
             for key, value in stored.items():
                 if key in DEFAULTS:
+                    if key in NATIVE_FIELDS and key in (plugin_config or {}):
+                        continue  # Native configuration changes must survive reload.
                     try:
                         self.overrides[key] = _coerce(key, value)
                     except (TypeError, ValueError):

@@ -14,11 +14,14 @@ Features
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 _VENDOR = Path(__file__).resolve().parent / "vendor"
 if _VENDOR.is_dir() and str(_VENDOR) not in sys.path:
@@ -34,6 +37,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .core.accounts import PLATFORMS, AccountStore
 from .core.activity import ActivityEngine
 from .core.browser import BrowserManager
+from .core.captcha import CaptchaSolver
 from .core.comfyui import ComfyUIClient
 from .core.deepseek_balance import DeepSeekBalance
 from .core.intent import IntentRouter
@@ -42,13 +46,20 @@ from .core.login import LoginManager, LoginSession
 from .core.montage import find_ffmpeg
 from .core.mood import MoodStore
 from .core.platforms import make_platform
+from .core.platforms.specs import site_spec
 from .core.settings import SettingsStore
+from .core.settings import NATIVE_FIELDS
 from .core.transcribe import Transcript
 from .core.util import human_seconds, now_tz, shorten
 from .core.video_analysis import VideoAnalyzer
+from .core.writer import DraftWriter
+from .core.manual_actions import ManualActions, ManualActionBusy
+from .core.tieba_actions import TiebaSession, TiebaActionError
+from .core.takeover import TakeoverError
+from .core.tieba_scope import is_post_url
 
 PLUGIN_NAME = "astrbot_plugin_cyber_life"
-VERSION = "1.3.1"
+VERSION = "1.3.1-gemini.62"
 
 HELP = """\
 🌿 赛博日常 · 内置浏览器
@@ -58,6 +69,7 @@ HELP = """\
 /life accounts            账号列表
 /life login <平台> [名字]  扫码登录（bilibili / xiaoheihe / tieba）
 /life confirm [会话id]     浏览器登录后如果没自动识别，手动确认
+/life captcha [平台]       查看待处理验证；加 resume 手动恢复该账号
 /life logout <平台>        退出并删除登录态
 /life run [分钟]           立刻开始一段活动（默认 10 分钟）
 /life play [平台] [分钟]   去指定平台逛一会儿（默认 15 分钟）
@@ -98,7 +110,9 @@ class CyberLifePlugin(Star):
             decay_per_hour=self.settings.float("mood_decay_per_hour"),
         )
         self.browser = BrowserManager(self.settings, self.data_dir)
-        self.llm = LLMHelper(context)
+        self.llm = LLMHelper(context, self.settings)
+        self.captcha = CaptchaSolver(self.browser, self.llm, self.settings, self.data_dir)
+        self.browser.captcha = self.captcha
         self.balance = DeepSeekBalance(self.settings, self.llm)
         self.analyzer = VideoAnalyzer(self.settings, self.llm, self.data_dir)
         self.comfy = ComfyUIClient(self.settings, self.data_dir)
@@ -111,6 +125,8 @@ class CyberLifePlugin(Star):
             except OSError:
                 pass
         self._pending_browse: dict[str, dict[str, Any]] = {}
+        self.writer = DraftWriter(context, self.settings, lambda: self._last_umo)
+        self._writer_preview: dict[str, Any] = {}
 
         self.login = LoginManager(
             self.accounts,
@@ -131,8 +147,12 @@ class CyberLifePlugin(Star):
             data_dir=self.data_dir,
             notify=self._notify,
             request_login=self._prompt_login_if_needed,
+            writer=self.writer,
         )
         self._tasks: set[asyncio.Task] = set()
+        self.manual_actions = ManualActions(self.engine, self.data_dir)
+        self.engine.tieba_actions = self.manual_actions
+        self._browser_install = {"state": "idle", "error": ""}
         self._register_web_apis()
         # `on_astrbot_loaded` only fires for the initial startup, not for a
         # hot reload, so make sure the activity loop also starts here.
@@ -151,7 +171,30 @@ class CyberLifePlugin(Star):
         base = f"/{PLUGIN_NAME}"
         routes = [
             (f"{base}/overview", self.api_overview, ["GET"], "Overview"),
+            (f"{base}/browser/install", self.api_browser_install, ["GET", "POST"], "Install Chromium runtime"),
+            (f"{base}/browser/remove-old-shell", self.api_browser_remove_old_shell, ["POST"], "Remove unused headless shell"),
+            (f"{base}/browser/takeover/start", self.api_takeover_start, ["POST"], "Claim the retained browser"),
+            (f"{base}/browser/takeover/frame/<session_id>", self.api_takeover_frame, ["GET"], "Browser viewport"),
+            (f"{base}/browser/takeover/input/<session_id>", self.api_takeover_input, ["POST"], "Browser mouse and keyboard"),
+            (f"{base}/browser/takeover/close/<session_id>", self.api_takeover_close, ["POST"], "Save and close manual control"),
             (f"{base}/settings", self.api_settings, ["GET", "POST"], "Settings"),
+            (f"{base}/tieba/preview", self.api_tieba_preview, ["GET"], "Preview configured Tieba feed without sending"),
+            (f"{base}/tieba/thread", self.api_tieba_thread, ["GET"], "Read one Tieba thread without sending"),
+            (f"{base}/tieba/target-probe", self.api_tieba_target_probe, ["GET"], "Probe a reply target without sending"),
+            (f"{base}/tieba/expand-probe", self.api_tieba_expand_probe, ["GET"], "Probe folded Tieba replies without sending"),
+            (f"{base}/tieba/scroll-target", self.api_tieba_scroll_target, ["GET"], "Scroll to a reply target without sending"),
+            (f"{base}/tieba/reply-probe", self.api_tieba_reply_probe, ["GET"], "Dry-run a Tieba reply without posting"),
+            (f"{base}/captcha/last", self.api_captcha_last, ["GET"], "Read the latest captcha screenshot"),
+            (f"{base}/tieba/posts-debug", self.api_tieba_posts_debug, ["GET"], "Read structured posts without sending"),
+            (f"{base}/tieba/inbox/preview", self.api_tieba_inbox_preview, ["GET"], "Read Tieba reply inbox without sending"),
+            (f"{base}/verification/release", self.api_verification_release, ["POST"], "Release a processed verification wait"),
+            (f"{base}/actions/start", self.api_manual_action_start, ["POST"], "Comment or reply once"),
+            (f"{base}/actions/status/<request_id>", self.api_manual_action_status, ["GET"], "Manual action result"),
+            (f"{base}/actions/recheck/<request_id>", self.api_manual_action_recheck, ["POST"], "Recheck an existing reply without sending"),
+            (f"{base}/actions/preview/<kind>", self.api_manual_action_preview, ["GET"], "Read one target without writing or sending"),
+            (f"{base}/writer/options", self.api_writer_options, ["GET"], "Writer models and personas"),
+            (f"{base}/writer/preview", self.api_writer_preview, ["POST"], "Draft without sending"),
+            (f"{base}/writer/preview/<preview_id>", self.api_writer_preview_status, ["GET"], "Draft preview result"),
             (f"{base}/mood", self.api_mood, ["GET", "POST"], "Mood"),
             (f"{base}/accounts", self.api_accounts, ["GET", "POST"], "Accounts"),
             (f"{base}/accounts/remove", self.api_account_remove, ["POST"], "Remove account"),
@@ -312,6 +355,10 @@ class CyberLifePlugin(Star):
                 yield event.plain_result(f"✅ 已确认登录：{session.message}")
             else:
                 yield event.plain_result("没有找到正在等待的登录会话")
+            return
+        if sub in ("captcha", "验证码"):
+            async for result in self._cmd_captcha(event, args):
+                yield result
             return
         if sub in ("logout", "退出"):
             if not args:
@@ -474,6 +521,63 @@ class CyberLifePlugin(Star):
             yield event.chain_result([Plain(text), Image.fromFileSystem(str(session.qr_path))])
         else:
             yield event.plain_result(text)
+
+    async def _cmd_captcha(self, event: AstrMessageEvent, args: list[str]):
+        """打开站点看有没有验证码，有就让视觉模型接手。"""
+        platform = (self._normalize_platform(args[0]) if args else "") or "tieba"
+        if platform not in PLATFORMS:
+            yield event.plain_result(f"不支持的平台：{args[0]}\n可选：tieba / xiaoheihe")
+            return
+        if platform == "bilibili":
+            yield event.plain_result("B站走的是接口，不需要过屏幕验证码；贴吧和小黑盒才用得到。")
+            return
+        account = self.accounts.active_account(platform)
+        name = account.name if account else "default"
+        manual_wait = self.manual_actions.verification.get(name, {}) if platform == "tieba" else {}
+        waiting = manual_wait or self.engine.browser_verification.get(f"{platform}:{name}", {})
+        if waiting:
+            if len(args) > 1 and args[1].lower() in {"resume", "恢复"}:
+                try:
+                    if manual_wait:
+                        self.manual_actions.clear_verification(name, waiting["job_id"])
+                    else:
+                        self.engine.clear_browser_verification(platform, name, waiting["job_id"])
+                    yield event.plain_result("已恢复，按原计划重新检查；本次未发送。")
+                except (ValueError, ManualActionBusy) as exc:
+                    yield event.plain_result(str(exc))
+            else:
+                url = waiting.get("url") or "没有可用验证链接，请通过官方页面处理"
+                yield event.plain_result(f"账号等待验证：{waiting.get('message', '')}\n{url}\n处理后在概览点击恢复，或发送 /life captcha {platform} resume")
+            return
+        if not self.settings.bool("captcha_auto_solve"):
+            yield event.plain_result("验证码自动识别已关闭。去 WebUI 设置里打开「AI 识屏过验证码」。")
+            return
+        spec = site_spec(platform)
+        url = str(spec.get("feed_url") or spec.get("login_url") or "")
+        if not url:
+            yield event.plain_result(f"{PLATFORMS[platform]['label']} 没有配置可打开的页面")
+            return
+        account = self.accounts.active_account(platform)
+        name = account.name if account else "default"
+        label = PLATFORMS[platform]["label"]
+        yield event.plain_result(f"🔍 打开{label}看看有没有验证码，有就试着过…")
+        result = await self.browser.pass_site_captcha(platform, name, url)
+        message = str(result.get("message") or "")
+        if result.get("solved"):
+            yield event.plain_result(f"✅ {label} 验证码已通过：{message}\n登录态已写回，接下来的操作可以直接用。")
+            return
+        if result.get("had"):
+            text = f"❌ {label} 有验证码但没通过：{message}"
+            shot = str(result.get("screenshot") or "")
+            if shot and Path(shot).exists():
+                yield event.chain_result([Plain(text + "\n截图："), Image.fromFileSystem(shot)])
+            else:
+                yield event.plain_result(text)
+            return
+        if not result.get("ok"):
+            yield event.plain_result(f"验证状态未确认：{message}")
+            return
+        yield event.plain_result(f"这次打开{label}没有遇到验证码（{message or '页面正常'}）")
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -1723,6 +1827,14 @@ class CyberLifePlugin(Star):
             f"最多 {self.settings.int('subtitle_max_seconds')} 秒）"
         )
 
+    def _captcha_setting_text(self) -> str:
+        if not self.settings.bool("captcha_auto_solve"):
+            return "关闭（遇到验证码直接停下）"
+        model = self.settings.str("vision_provider_id")
+        model_text = "指定视觉模型" if model else "跟随当前会话模型"
+        slider = "含滑块" if self.settings.bool("captcha_slider") else "仅图片字符"
+        return f"开启（{slider}；最多 {self.settings.int('captcha_max_attempts')} 次；{model_text}）"
+
     def _settings_text(self) -> str:
         now = now_tz(self.settings.str("timezone"))
         schedule = self.settings.schedule()
@@ -1742,6 +1854,7 @@ class CyberLifePlugin(Star):
             f"Bot 自行调整使用时间：{'开启' if self.settings.bool('agent_manage_usage') else '关闭'}",
             f"活动记录：{'仅内部可见（不往聊天输出）' if self.settings.bool('activity_private') else '允许输出到聊天'}",
             f"语音转字幕：{self._subtitle_setting_text()}",
+            f"AI 识屏过验证码：{self._captcha_setting_text()}",
             f"访问模式：{desc['mode_label']}（现在 {desc['phase_label']}）",
             f"自动峰时：{peak_text}",
             f"节假日：{holiday_text}",
@@ -1754,6 +1867,336 @@ class CyberLifePlugin(Star):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------- APIs
+    async def api_takeover_start(self):
+        payload = await request.json(default={})
+        if self.engine._busy:
+            return error_response("任务还在执行，结束后再接管浏览器", status_code=409)
+        session_id = str(payload.get("id") or "")
+        if session_id:
+            try:
+                return json_response(await self.browser.takeovers.claim(session_id))
+            except TakeoverError as exc:
+                return error_response(str(exc), status_code=409)
+        name = str(payload.get("account_name") or "")
+        account = self.accounts.get("tieba", name) if name else self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧账号", status_code=400)
+        waiting = self.manual_actions.verification.get(account.name, {})
+        job_id = str(payload.get("job_id") or waiting.get("job_id") or "")
+        job = self.manual_actions.jobs.get(job_id, {})
+        if job_id and ((waiting and waiting.get("job_id") != job_id)
+                       or not job or job.get("account_name") != account.name):
+            return error_response("等待记录已变化，请刷新后再接管", status_code=409)
+        session = self.browser.takeovers.for_account("tieba", account.name)
+        if session:
+            return json_response(await self.browser.takeovers.claim(session.id))
+        if not job:
+            recent = self.manual_actions.public().get("current") or {}
+            if recent.get("account_name") == account.name:
+                job = recent
+                job_id = str(recent.get("id") or "")
+        url = str(waiting.get("url") or job.get("thread", {}).get("url") or "")
+        if not is_post_url(url):
+            forums = self.settings.list("tieba_forums")
+            if not forums:
+                return error_response("请先设置允许的贴吧", status_code=400)
+            url = "https://tieba.baidu.com/f?kw=" + quote(str(forums[0]))
+        elif "?" not in url:
+            url += "?showComment=1&fr=pb"
+        self.engine._busy = True
+        context = None
+        opened = None
+        try:
+            fingerprint = self.browser.storage_fingerprint("tieba", account.name)
+            context = await self.browser.new_context(self.browser.storage_path("tieba", account.name))
+            await self.browser.hydrate_cookies(context, "tieba", account.name)
+            page = await context.new_page()
+            opened = await self.browser.takeovers.retain(
+                context, page, "tieba", account.name, fingerprint, job_id=job_id, original=False)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            return json_response(await self.browser.takeovers.claim(opened.id))
+        except Exception as exc:
+            if opened:
+                await self.browser.takeovers.close(opened.id, save=False)
+            elif context:
+                await context.close()
+            return error_response("打开接管浏览器失败：" + type(exc).__name__, status_code=400)
+        finally:
+            self.engine._busy = False
+
+    async def api_takeover_frame(self, session_id: str):
+        try:
+            frame = await self.browser.takeovers.frame(session_id)
+            waiting = self.manual_actions.verification.get(frame["account_name"], {})
+            frame["can_resume"] = bool(waiting and waiting.get("job_id") == frame["job_id"])
+            return json_response(frame)
+        except TakeoverError as exc:
+            return error_response(str(exc), status_code=409)
+        except Exception as exc:
+            return error_response("读取浏览器画面失败：" + type(exc).__name__, status_code=400)
+
+    async def api_takeover_input(self, session_id: str):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.browser.takeovers.input(session_id, payload))
+        except (TakeoverError, ValueError) as exc:
+            return error_response(str(exc), status_code=409)
+        except Exception as exc:
+            return error_response("浏览器操作失败：" + type(exc).__name__, status_code=400)
+
+    async def api_takeover_close(self, session_id: str):
+        payload = await request.json(default={})
+        if self.engine._busy:
+            return error_response("任务正在执行，请稍后结束接管", status_code=409)
+        try:
+            session = self.browser.takeovers.get(session_id)
+            save = payload.get("save", True)
+            if not isinstance(save, bool):
+                raise ValueError("保存参数无效")
+            waiting = self.manual_actions.verification.get(session.account_name, {})
+            resume = payload.get("processed") is True
+            if resume and (not waiting or waiting.get("job_id") != session.job_id):
+                raise ValueError("等待记录已变化，请在概览核对后恢复")
+            result = await self.browser.takeovers.close(session_id, save=save)
+            if resume:
+                self.manual_actions.clear_verification(session.account_name, session.job_id)
+            return json_response({**result, "released": resume,
+                                  "message": "已结束接管并恢复账号" if resume else "已结束浏览器接管"})
+        except (TakeoverError, ValueError, ManualActionBusy) as exc:
+            return error_response(str(exc), status_code=409)
+        except Exception as exc:
+            return error_response("结束接管失败：" + type(exc).__name__, status_code=400)
+
+    async def api_tieba_preview(self):
+        try:
+            adapter = make_platform("tieba", self.accounts, self.browser)
+            posts = await adapter.feed(5)
+            return json_response({"forums": self.settings.list("tieba_forums"),
+                                  "posts": [post.public() for post in posts], "page": adapter.last_feed,
+                                  "preview_only": True})
+        except Exception as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def api_tieba_thread(self):
+        tid = str(request.query.get("tid") or "").strip()
+        if not tid:
+            return error_response("请提供帖子编号 tid", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        result = await self.browser.read_tieba_thread(
+            account.name, tid,
+            target=str(request.query.get("target") or ""),
+            comment_view=str(request.query.get("comment_view") or "") in {"1", "true"},
+            pn=int(str(request.query.get("pn") or "0")) if str(request.query.get("pn") or "0").isdigit() else 0,
+        )
+        return json_response(result) if result.get("ok") else error_response(
+            str(result.get("message") or "读取失败"),
+            status_code=409 if result.get("verification_required") else 400,
+        )
+
+    async def api_tieba_target_probe(self):
+        tid = str(request.query.get("tid") or "").strip()
+        target = str(request.query.get("target") or "").strip()
+        if not tid or not target:
+            return error_response("请提供帖子编号 tid 和目标正文 target", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        result = await self.browser.probe_tieba_target(
+            account.name, tid, target=target,
+            parent_pid=str(request.query.get("parent_pid") or ""),
+            sub_pid=str(request.query.get("sub_pid") or ""),
+        )
+        return json_response(result) if result.get("ok") else error_response(
+            str(result.get("message") or "探测失败"), status_code=400
+        )
+
+    async def api_tieba_expand_probe(self):
+        tid = str(request.query.get("tid") or "").strip()
+        if not tid:
+            return error_response("请提供帖子编号 tid", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        pn = str(request.query.get("pn") or "1")
+        result = await self.browser.probe_tieba_expanders(
+            account.name, tid, pn=int(pn) if pn.isdigit() else 1,
+            text=str(request.query.get("text") or ""),
+            sub_pid=str(request.query.get("sub_pid") or ""),
+        )
+        return json_response(result) if result.get("ok") else error_response(
+            str(result.get("message") or "探测失败"), status_code=400
+        )
+
+    async def api_tieba_scroll_target(self):
+        tid = str(request.query.get("tid") or "").strip()
+        text = str(request.query.get("text") or "").strip()
+        if not tid or not text:
+            return error_response("请提供帖子编号 tid 和目标正文 text", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        steps = str(request.query.get("steps") or "40")
+        result = await self.browser.probe_tieba_scroll_target(
+            account.name, tid, text=text,
+            parent_pid=str(request.query.get("parent_pid") or ""),
+            sub_pid=str(request.query.get("sub_pid") or ""),
+            label=str(request.query.get("label") or "正序"),
+            steps=int(steps) if steps.isdigit() else 40,
+        )
+        return json_response(result) if result.get("ok") else error_response(
+            str(result.get("message") or "探测失败"), status_code=400
+        )
+
+    async def api_tieba_reply_probe(self):
+        tid = str(request.query.get("tid") or "").strip()
+        text = str(request.query.get("text") or "").strip()
+        if not tid or not text:
+            return error_response("请提供帖子编号 tid 和目标正文 text", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        result = await self.browser.probe_tieba_reply_submit(
+            account.name, tid, text=text,
+            parent_pid=str(request.query.get("parent_pid") or ""),
+            sub_pid=str(request.query.get("sub_pid") or ""),
+            body=str(request.query.get("body") or "测试输入，不发送"),
+            verify=str(request.query.get("verify") or "").lower() in {"1", "true", "yes"},
+        )
+        return json_response(result) if result.get("ok") else error_response(
+            str(result.get("message") or "探测失败"), status_code=400
+        )
+
+    async def api_captcha_last(self):
+        try:
+            files = sorted(self.captcha.shots_dir.glob("*.png"),
+                           key=lambda path: path.stat().st_mtime)
+        except Exception:  # noqa: BLE001
+            files = []
+        if not files:
+            return error_response("没有验证码截图", status_code=404)
+        latest = files[-1]
+        try:
+            payload = base64.b64encode(latest.read_bytes()).decode("ascii")
+        except OSError:
+            return error_response("验证码截图读取失败", status_code=500)
+        return json_response({"name": latest.name, "mtime": latest.stat().st_mtime,
+                              "b64": payload})
+
+    async def api_tieba_posts_debug(self):
+        tid = str(request.query.get("tid") or "").strip()
+        anchor = str(request.query.get("anchor") or "").strip()
+        if not tid:
+            return error_response("请提供帖子编号 tid", status_code=400)
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        try:
+            async with TiebaSession(self.browser, account.name) as session:
+                thread = await session.thread(tid, anchor=anchor)
+        except Exception as exc:  # noqa: BLE001
+            return error_response(str(exc), status_code=400)
+        posts = [{
+            "pid": row.get("pid"), "floor": row.get("floor"),
+            "author_id": row.get("author_id"), "author": row.get("author"),
+            "content": str(row.get("content") or "")[:160],
+        } for row in thread.get("posts", [])]
+        return json_response({"tid": tid, "anchor": anchor,
+                              "title": thread.get("title"), "forum": thread.get("forum"),
+                              "posts": posts})
+
+    async def api_tieba_inbox_preview(self):
+        account = self.accounts.active_account("tieba")
+        if not account or account.status != "logged_in":
+            return error_response("请先登录贴吧", status_code=400)
+        try:
+            async with TiebaSession(self.browser, account.name) as session:
+                uid = await session.identity()
+                messages = await session.inbox()
+            return json_response({"uid": uid, "messages": messages, "preview_only": True})
+        except Exception as exc:
+            return error_response(str(exc) if isinstance(exc, TiebaActionError) else type(exc).__name__, status_code=400)
+
+    async def api_verification_release(self):
+        payload = await request.json(default={})
+        if payload.get("processed") is not True:
+            return error_response("请处理验证后再恢复", status_code=400)
+        platform, name = str(payload.get("platform") or ""), str(payload.get("account_name") or "")
+        job_id = str(payload.get("job_id") or "")
+        try:
+            if platform == "tieba" and self.manual_actions.is_waiting(name):
+                self.manual_actions.clear_verification(name, job_id)
+            else:
+                self.engine.clear_browser_verification(platform, name, job_id)
+        except (ValueError, ManualActionBusy) as exc:
+            return error_response(str(exc), status_code=409)
+        return json_response({"released": True, "message": "已恢复，按原计划重新检查；本次未发送"})
+
+    async def api_manual_action_start(self):
+        payload = await request.json(default={})
+        try:
+            job, created = self.manual_actions.start(str(payload.get("kind") or ""), str(payload.get("request_id") or ""))
+        except ManualActionBusy as exc:
+            return error_response(str(exc), status_code=409)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if created:
+            self._spawn(self.manual_actions.run(job["id"]))
+        return json_response(dict(job))
+
+    async def api_manual_action_status(self, request_id: str):
+        job = self.manual_actions.jobs.get(request_id)
+        return json_response(dict(job)) if job else error_response("任务不存在", status_code=404)
+
+    async def api_manual_action_recheck(self, request_id: str):
+        payload = await request.json(default={})
+        try:
+            return json_response(await self.manual_actions.recheck(request_id, str(payload.get("pid") or "")))
+        except (ValueError, ManualActionBusy, TakeoverError) as exc:
+            return error_response(str(exc), status_code=409)
+        except Exception as exc:
+            return error_response("核对失败：" + type(exc).__name__, status_code=400)
+
+    async def api_manual_action_preview(self, kind: str):
+        if kind not in {"comment", "reply"}:
+            return error_response("操作类型无效", status_code=400)
+        if self.engine._busy:
+            return error_response("已有任务正在执行", status_code=409)
+        try:
+            return json_response(await self.manual_actions.preview(kind))
+        except Exception as exc:
+            return error_response(str(exc) if isinstance(exc, TiebaActionError) else type(exc).__name__, status_code=400)
+
+    async def api_browser_remove_old_shell(self):
+        if self._browser_install["state"] == "running":
+            return error_response("浏览器正在安装，请完成后再清理", status_code=409)
+        try:
+            result = await asyncio.to_thread(self.browser.remove_old_headless_shell)
+            return json_response(result)
+        except Exception as exc:
+            return error_response(str(exc), status_code=400)
+
+    async def api_browser_install(self):
+        if request.method == "POST" and self._browser_install["state"] != "running":
+            if not BrowserManager.installed():
+                return error_response("请先安装 Playwright Python 依赖", status_code=400)
+            self._browser_install = {"state": "running", "error": ""}
+            self._spawn(self._install_browser_runtime())
+        return json_response({**self._browser_install, "executables": self.browser.local_executables()})
+
+    async def _install_browser_runtime(self):
+        try:
+            await self.browser.install_chromium()
+            self._browser_install = {"state": "success", "error": ""}
+            logger.info("[cyber-life] Chromium 已安装到持久化数据目录")
+        except asyncio.CancelledError:
+            self._browser_install = {"state": "error", "error": "安装已取消"}
+            raise
+        except Exception as exc:
+            self._browser_install = {"state": "error", "error": str(exc) or type(exc).__name__}
+            logger.warning(f"[cyber-life] Chromium 安装失败：{type(exc).__name__}")
+
     async def api_overview(self):
         now = now_tz(self.settings.str("timezone"))
         return json_response(
@@ -1761,6 +2204,8 @@ class CyberLifePlugin(Star):
                 "plugin": PLUGIN_NAME,
                 "version": VERSION,
                 "status": self.engine.status(),
+                "manual_actions": self.manual_actions.public(),
+                "browser_takeovers": self.browser.takeovers.list(),
                 "mood": self.mood.card(),
                 "accounts": self.accounts.public_list(),
                 "platforms": self.accounts.available_platforms(),
@@ -1769,6 +2214,7 @@ class CyberLifePlugin(Star):
                 "holidays": self.settings.holidays.status(now),
                 "dependencies": {
                     "playwright": BrowserManager.installed(),
+                    "browser_executables": self.browser.local_executables(),
                     "qrcode": self._has_module("qrcode"),
                     "ffmpeg": bool(find_ffmpeg(self.settings.str("ffmpeg_path"))),
                     "llm": self.llm.available,
@@ -1792,12 +2238,59 @@ class CyberLifePlugin(Star):
             payload = await request.json(default={})
             try:
                 saved = self.settings.update(payload)
+                config_patch = {key: value for key, value in saved.items() if key in NATIVE_FIELDS}
+                if config_patch:
+                    self.config.update(config_patch)
+                    save = getattr(self.config, "save_config", None)
+                    if callable(save):
+                        save()
             except (TypeError, ValueError) as exc:
                 return error_response(str(exc), status_code=400)
             self.mood.weight = self.settings.float("mood_chat_weight")
             self.mood.decay_per_hour = self.settings.float("mood_decay_per_hour")
             return json_response({"saved": saved, "settings": self.settings.public(now_tz(self.settings.str("timezone")))})
         return json_response(self.settings.public(now_tz(self.settings.str("timezone"))))
+
+    async def api_writer_options(self):
+        providers = []
+        for provider in self.context.get_all_providers():
+            meta = provider.meta()
+            provider_id = str(getattr(meta, "id", ""))
+            if provider_id and callable(getattr(provider, "text_chat", None)):
+                providers.append({"id": provider_id, "label": provider_id})
+        personas = [{"id": p["name"], "label": p["name"]}
+                    for p in self.context.persona_manager.personas_v3]
+        return json_response({"providers": providers, "personas": personas})
+
+    async def api_writer_preview(self):
+        if self._writer_preview.get("state") == "running":
+            return error_response("已有一条预览正在生成", status_code=409)
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("预览参数必须是对象", status_code=400)
+        kind = payload.get("kind", "comment")
+        if kind not in {"comment", "reply"}:
+            return error_response("只支持评论或跟进回复", status_code=400)
+        material = {key: str(payload.get(key, "") or "")[:6000]
+                    for key in ("title", "content", "own_comment", "incoming", "author")}
+        if not any(material[k].strip() for k in ("title", "content", "incoming")):
+            return error_response("先填写实际内容", status_code=400)
+        limit = max(8, self.settings.int("reply_max_chars" if kind == "reply" else "comment_max_chars"))
+        preview_id = uuid.uuid4().hex
+        self._writer_preview = {"id": preview_id, "state": "running", "preview_only": True}
+        self._spawn(self._generate_writer_preview(preview_id, kind, material, limit))
+        return json_response(dict(self._writer_preview))
+
+    async def _generate_writer_preview(self, preview_id: str, kind: str, material: dict, limit: int):
+        # No activity engine, browser, counters, notifications or memory writes.
+        result = await self.writer.draft(kind=kind, material=material, max_chars=limit)
+        self._writer_preview = {**result.public(), "id": preview_id, "state": "done",
+                                "preview_only": True, "max_chars": limit}
+
+    async def api_writer_preview_status(self, preview_id: str):
+        if self._writer_preview.get("id") != preview_id:
+            return error_response("预览记录不存在或插件已重载", status_code=404)
+        return json_response(dict(self._writer_preview))
 
     async def api_mood(self):
         if request.method == "POST":
@@ -1862,7 +2355,7 @@ class CyberLifePlugin(Star):
         return json_response({"cancelled": ok})
 
     async def api_activity(self):
-        return json_response(self.engine.status())
+        return json_response({**self.engine.status(), "manual_actions": self.manual_actions.public()})
 
     async def api_activity_reset(self):
         self.engine.reset_today()
@@ -1930,3 +2423,9 @@ class CyberLifePlugin(Star):
         force = request.method == "POST"
         result = await self.balance.fetch(force=force)
         return json_response(result.public())
+
+
+
+
+
+

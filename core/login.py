@@ -162,10 +162,22 @@ class LoginManager:
             handle = await self.browser.begin_login(session.platform, session.name, spec)
             session.handle = handle
             session.qr_path = handle.screenshot
-            session.message = f"用 {spec.get('label', session.platform)} App 扫码，扫完可发送 /life confirm {session.id}"
+            session.message = self._login_message(session, handle, spec)
         except Exception as exc:  # noqa: BLE001
             session.status = "error"
             session.message = f"打开登录页失败：{exc}"
+
+    @staticmethod
+    def _login_message(session: LoginSession, handle: BrowserLoginHandle, spec: dict) -> str:
+        """把登录页验证码的结果写进提示，免得整段流程卡在看不见的地方。"""
+        captcha = (handle.notes or {}).get("captcha") or {}
+        prefix = ""
+        if captcha.get("solved"):
+            prefix = f"登录页{captcha.get('message') or '验证码已通过'}；"
+        elif captcha.get("had"):
+            prefix = f"登录页有验证码没过（{captcha.get('message') or '需要人工'}），可能要手工处理；"
+        label = spec.get("label", session.platform)
+        return f"{prefix}用 {label} App 扫码，扫完可发送 /life confirm {session.id}"
 
     async def _poll_loop(self, session: LoginSession) -> None:
         try:

@@ -22,6 +22,7 @@ from PIL import Image
 
 from core.accounts import AccountStore
 from core.activity import ActivityEngine
+from core.browser import BrowserManager
 from core.login import render_qr
 from core.montage import Frame, choose_frame_count, make_contact_sheet
 from core.mood import MoodStore
@@ -311,6 +312,7 @@ class MontageTests(TempDirCase):
 class ActivityManualTaskTests(TempDirCase):
     def test_explicit_multi_platform_task_runs_immediately(self):
         class Account:
+            name = "default"
             status = "logged_in"
 
         class Accounts:
@@ -325,7 +327,7 @@ class ActivityManualTaskTests(TempDirCase):
             analyzer=None,
             comfy=None,
             llm=None,
-            browser=None,
+            browser=BrowserManager(settings, self.tmp),
             data_dir=self.tmp,
             notify=self._notify,
         )
@@ -342,6 +344,7 @@ class ActivityManualTaskTests(TempDirCase):
 
     def test_task_queued_while_busy_runs_after_release(self):
         class Account:
+            name = "default"
             status = "logged_in"
 
         class Accounts:
@@ -356,7 +359,7 @@ class ActivityManualTaskTests(TempDirCase):
             analyzer=None,
             comfy=None,
             llm=None,
-            browser=None,
+            browser=BrowserManager(settings, self.tmp),
             data_dir=self.tmp,
             notify=self._notify,
         )

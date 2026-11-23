@@ -12,11 +12,16 @@ from astrbot.api import logger
 
 
 class LLMHelper:
-    def __init__(self, context: Any) -> None:
+    def __init__(self, context: Any, settings: Any = None) -> None:
         self.context = context
+        self.settings = settings
 
-    def provider(self, umo: str | None = None):
+    def provider(self, umo: str | None = None, *, vision: bool = False):
         try:
+            if self.settings:
+                selected = self.settings.str("vision_provider_id" if vision else "analysis_provider_id")
+                if selected:
+                    return self.context.get_provider_by_id(selected)
             return self.context.get_using_provider(umo or None)
         except Exception:  # noqa: BLE001
             return None
@@ -34,7 +39,7 @@ class LLMHelper:
         timeout: float = 120,
         umo: str | None = None,
     ) -> str | None:
-        provider = self.provider(umo)
+        provider = self.provider(umo, vision=bool(images))
         if provider is None:
             return None
         kwargs: dict[str, Any] = {}

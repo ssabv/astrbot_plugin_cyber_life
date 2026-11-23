@@ -1,4 +1,43 @@
 {
+  "writer_enabled": {
+    "description": "独立写稿：评论与跟进回复交给指定模型",
+    "type": "bool", "default": false,
+    "hint": "开启后生成失败不发送，不使用分析模型或固定模板顶替"
+  },
+  "writer_provider_id": {
+    "description": "写稿模型（可选 Gemini，留空跟随当前会话）",
+    "type": "string", "default": "", "_special": "select_provider"
+  },
+  "writer_persona_id": {
+    "description": "写稿人格（留空跟随来源会话）",
+    "type": "string", "default": "", "_special": "select_persona"
+  },
+  "writer_context_umo": {
+    "description": "写稿来源会话 UMO（解析人格和记忆权限）",
+    "type": "string", "default": "",
+    "hint": "留空使用最后一次实际会话；不改变通知接收人或工具权限"
+  },
+  "writer_timeout": {
+    "description": "写稿总超时（秒，含人格和记忆）",
+    "type": "int", "default": 180
+  },
+  "writer_livingmemory_enabled": {
+    "description": "写稿注入 LivingMemory 相关记忆与档案",
+    "type": "bool", "default": true,
+    "hint": "遵循原有记忆权限，只读召回；不会触发其他插件完整回复管线"
+  },
+  "writer_memory_timeout": {
+    "description": "记忆召回超时（秒）",
+    "type": "int", "default": 15
+  },
+  "analysis_provider_id": {
+    "description": "内容分析模型（留空跟随当前会话）",
+    "type": "string", "default": "", "_special": "select_provider"
+  },
+  "vision_provider_id": {
+    "description": "截图识图模型（留空跟随当前会话）",
+    "type": "string", "default": "", "_special": "select_provider"
+  },
   "enabled": {
     "description": "启用赛博日常",
     "type": "bool",
@@ -89,6 +128,12 @@
     "default": 60,
     "slider": {"min": 0, "max": 240, "step": 5}
   },
+  "browse_enabled": {
+    "description": "自动刷帖",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不执行刷帖和刷帖计时；贴吧评论/回复仍按各自间隔运行"
+  },
   "comment_interval_min": {
     "description": "评论最小间隔（分钟）",
     "type": "int",
@@ -135,6 +180,12 @@
     "description": "参与刷帖的平台",
     "type": "list",
     "default": ["bilibili", "xiaoheihe", "tieba"]
+  },
+  "tieba_forums": {
+    "description": "允许的贴吧",
+    "type": "list",
+    "default": [],
+    "hint": "填写吧名，例如大肥鱼。多个吧名用逗号或换行分隔；留空浏览首页。填写后只浏览这些吧，评论前核对所属吧"
   },
   "video_min_frames": {
     "description": "视频最少截图张数",
@@ -255,6 +306,24 @@
     "description": "自定义浏览器路径（留空自动）",
     "type": "string",
     "default": ""
+  },
+  "captcha_auto_solve": {
+    "description": "AI 识屏过验证码：撞到验证码时截图给视觉模型自动处理",
+    "type": "bool",
+    "default": true,
+    "hint": "图片验证码自动填写；滑块按模型给的缺口位置拖动。失败会留下截图，交给人处理"
+  },
+  "captcha_max_attempts": {
+    "description": "验证码最多尝试次数",
+    "type": "int",
+    "default": 3,
+    "hint": "每次失败会点「换一张」重试；连续失败就停下，不硬闯"
+  },
+  "captcha_slider": {
+    "description": "自动拖滑块（关掉只处理图片字符验证码）",
+    "type": "bool",
+    "default": true,
+    "hint": "滑块依赖视觉模型估算缺口位置，成功率不稳定；不放心可以关掉"
   },
   "notify_actions": {
     "description": "把看视频/评论动态主动发到会话（默认关；bot 仍可在后台查看）",

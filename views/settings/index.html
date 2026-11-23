@@ -26,11 +26,48 @@
       <nav class="tabs" id="tabs">
         <button class="tab active" data-tab="overview">概览</button>
         <button class="tab" data-tab="accounts">账号</button>
+        <button class="tab" data-tab="takeover">人工接管</button>
         <button class="tab" data-tab="settings">设置</button>
         <button class="tab" data-tab="activity">动态</button>
       </nav>
 
       <main>
+        <section class="panel" id="tab-takeover">
+          <article class="card">
+            <div class="card-head"><h2>人工接管浏览器</h2><button class="btn" id="takeover-open">打开当前贴吧账号</button></div>
+            <p class="muted">点击画面操作，拖动可处理滑块。键盘输入可在下方填写；平板也能操作。页面上的发布按钮会真正发送，结果未知时请先核对是否已发出。</p>
+            <div id="takeover-sessions" class="takeover-sessions"></div>
+            <p id="takeover-status" class="muted">选择一个保留的现场，或打开当前贴吧账号。</p>
+            <div id="takeover-controls" hidden>
+              <div class="takeover-toolbar">
+                <button class="btn" data-browser-action="back">后退</button>
+                <button class="btn" data-browser-action="reload">刷新页面</button>
+                <button class="btn" data-browser-scroll="-450">向上滚动</button>
+                <button class="btn" data-browser-scroll="450">向下滚动</button>
+                <select id="takeover-tabs" aria-label="浏览器标签页"></select>
+                <select id="takeover-zoom" aria-label="画面缩放"><option value="fit">适应宽度</option><option value="1">原始大小</option><option value="1.5">放大150%</option></select>
+                <select id="takeover-mode" aria-label="操作模式"><option value="control">操作浏览器</option><option value="pan">平移画面</option></select>
+              </div>
+              <div id="takeover-url" class="muted takeover-url"></div>
+              <div class="takeover-viewport" id="takeover-viewport"><canvas id="takeover-canvas" tabindex="0" aria-label="可点击、拖动的浏览器画面"></canvas></div>
+              <label class="field"><span>输入到浏览器<small>先点击画面里的输入框，再输入文字</small></span><textarea id="takeover-text" rows="2" maxlength="8192" placeholder="验证码、评论或其他文字"></textarea></label>
+              <div class="takeover-toolbar">
+                <button class="btn" id="takeover-type">输入文字</button>
+                <button class="btn" data-browser-key="Enter">回车</button>
+                <button class="btn" data-browser-key="Tab">Tab</button>
+                <button class="btn" data-browser-key="Backspace">退格</button>
+                <button class="btn" data-browser-key="Control+A">全选</button>
+                <button class="btn" data-browser-key="Escape">Esc</button>
+              </div>
+              <div class="takeover-toolbar takeover-finish">
+                <button class="btn primary" id="takeover-save">保存登录状态并结束接管</button>
+                <button class="btn" id="takeover-resume">处理完毕并恢复账号</button>
+                <button class="btn ghost" id="takeover-discard">结束接管，不保存登录状态</button>
+              </div>
+              <p class="muted">放大后可选“平移画面”移动视野，再切回“操作浏览器”。接管期间该账号不执行自动活动；恢复账号不会补发结果未知的回复。离开画面30分钟后关闭现场。</p>
+            </div>
+          </article>
+        </section>
         <section class="panel active" id="tab-overview">
           <div class="grid overview-grid">
             <article class="card mood-card">
@@ -81,9 +118,13 @@
               <div class="now-line"><span class="dot" id="run-dot"></span><span id="now-text">待机中</span></div>
               <div class="quick-actions">
                 <button class="btn primary" id="run-btn">立即活动 10 分钟</button>
+                <button class="btn" id="comment-once-btn">立即评论一次</button>
+                <button class="btn" id="reply-once-btn">立即回复一次</button>
                 <button class="btn" id="stop-btn">暂停</button>
                 <button class="btn" id="draw-btn">让她画一张</button>
               </div>
+              <p class="muted">贴吧手动操作：评论按发帖时间从新到旧挑选，跳过已评论、置顶及不合适的帖子。跳过等待和概率，每次最多一条，不占自动每日额度。回复会检查“回复我的”；没有新消息就跳过。</p>
+              <div id="manual-action-result" aria-live="polite"></div>
             </article>
 
             <article class="card wide">
@@ -93,7 +134,14 @@
               </div>
               <div class="chips" id="platform-chips"></div>
               <div class="dep-grid" id="deps"></div>
+              <div class="quick-actions">
+                <button class="btn" type="button" id="install-browser-btn" hidden>安装完整 Chromium（新无头）</button>
+                <span class="muted" id="browser-install-status"></span>
+              </div>
               <div class="next-grid" id="next-times"></div>
+              <div id="verification-waits" aria-live="polite"></div>
+              <p class="muted" id="auto-comment-status" aria-live="polite"></p>
+              <p class="muted" id="auto-reply-status" aria-live="polite"></p>
             </article>
           </div>
         </section>
@@ -161,6 +209,17 @@
                   <span><b>浏览器无头模式</b><small>截不到二维码时可关闭</small></span>
                   <input type="checkbox" data-key="browser_headless" data-type="bool" />
                 </label>
+                <label class="switch-row">
+                  <span><b>AI 识屏过验证码</b><small>撞到验证码时截图给视觉模型，自动填写或拖滑块</small></span>
+                  <input type="checkbox" data-key="captcha_auto_solve" data-type="bool" />
+                </label>
+                <label class="switch-row">
+                  <span><b>自动拖滑块</b><small>关掉只处理图片字符验证码</small></span>
+                  <input type="checkbox" data-key="captcha_slider" data-type="bool" />
+                </label>
+                <label class="field"><span>验证码最多尝试次数<small>失败会换一张重试，连续失败就停下</small></span>
+                  <input type="number" min="1" max="6" step="1" data-key="captcha_max_attempts" data-type="int" />
+                </label>
               </article>
 
               <article class="card">
@@ -203,8 +262,12 @@
                   </label>
                 </div>
                 <label class="field" style="margin-top: 14px;">
-                  <span>每天刷帖上限（分钟）<small>大约一小时，按实际刷的时间算</small></span>
+                  <span>每天刷帖上限（分钟）<small>只限制自动刷帖；贴吧评论和回复按自己的时间运行</small></span>
                   <input type="number" data-key="daily_watch_minutes" data-type="int" />
+                </label>
+                <label class="switch-row" style="margin-top: 12px;">
+                  <span><b>自动刷帖</b><small>关闭后只保留定时贴吧评论和回复</small></span>
+                  <input type="checkbox" data-key="browse_enabled" data-type="bool" />
                 </label>
               </article>
 
@@ -225,6 +288,33 @@
                   <span>余额接口地址<small>留空自动使用当前提供商的 api_base</small></span>
                   <input type="text" data-key="deepseek_balance_base_url" data-type="string" placeholder="https://api.deepseek.com" />
                 </label>
+              </article>
+
+              <article class="card">
+                <div class="card-head"><h2>独立写稿</h2></div>
+                <label class="switch-row"><span><b>独立生成评论和跟进回复</b><small>模型失败或正文超过字数上限时，本轮不发送</small></span><input type="checkbox" data-key="writer_enabled" data-type="bool" /></label>
+                <label class="field"><span>写稿模型</span><select data-key="writer_provider_id" data-type="string"><option value="">跟随当前会话模型</option></select></label>
+                <label class="field"><span>写稿人格</span><select data-key="writer_persona_id" data-type="string"><option value="">跟随来源会话人格</option><option value="[%None]">不使用人格</option></select></label>
+                <div class="two-col">
+                  <label class="field"><span>内容分析模型</span><select data-key="analysis_provider_id" data-type="string"><option value="">跟随当前会话模型</option></select></label>
+                  <label class="field"><span>识图模型</span><select data-key="vision_provider_id" data-type="string"><option value="">跟随当前会话模型</option></select></label>
+                </div>
+                <label class="switch-row"><span><b>注入 LivingMemory</b><small>按记忆插件原有权限召回相关记忆与档案，只读不写入</small></span><input type="checkbox" data-key="writer_livingmemory_enabled" data-type="bool" /></label>
+                <label class="field"><span>来源会话 UMO<small>用于解析人格与记忆范围；留空使用最后一次实际会话</small></span><input type="text" data-key="writer_context_umo" data-type="string" /></label>
+                <div class="two-col">
+                  <label class="field"><span>写稿总超时（秒）</span><input type="number" min="10" max="600" data-key="writer_timeout" data-type="int" /></label>
+                  <label class="field"><span>记忆召回超时（秒）</span><input type="number" min="1" max="60" data-key="writer_memory_timeout" data-type="int" /></label>
+                </div>
+                <details><summary>试写一条（先保存设置）</summary>
+                  <label class="field"><span>类型</span><select id="writer-preview-kind"><option value="comment">评论帖子/视频</option><option value="reply">回复对方评论</option></select></label>
+                  <label class="field"><span>帖子标题</span><input type="text" id="writer-preview-title" /></label>
+                  <label class="field"><span>帖子/视频实际内容</span><textarea id="writer-preview-content" rows="3"></textarea></label>
+                  <label class="field"><span>自己先前的评论（跟进时填写）</span><input type="text" id="writer-preview-own" /></label>
+                  <label class="field"><span>对方的回复（跟进时填写）</span><input type="text" id="writer-preview-incoming" /></label>
+                  <button type="button" class="btn" id="writer-preview-btn">只生成，不发送</button>
+                  <p id="writer-preview-status" class="muted" role="status"></p>
+                  <pre id="writer-preview-output" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+                </details>
               </article>
 
               <article class="card">
@@ -257,6 +347,10 @@
                   <span>刷哪些平台</span>
                   <div class="checks" id="platform-checks"></div>
                 </div>
+                <label class="field">
+                  <span>允许的贴吧<small>每行一个吧名，例如“大肥鱼”。留空浏览首页；填写后只浏览和评论这些吧。</small></span>
+                  <textarea data-key="tieba_forums" data-type="list" rows="3" placeholder="大肥鱼"></textarea>
+                </label>
                 <div class="two-col">
                   <label class="field"><span>两次刷帖最小间隔（分）</span><input type="number" data-key="browse_interval_min" data-type="int" /></label>
                   <label class="field"><span>两次刷帖最大间隔（分）</span><input type="number" data-key="browse_interval_max" data-type="int" /></label>

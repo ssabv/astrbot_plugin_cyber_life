@@ -51,3 +51,5 @@ class CommentResult:
     message: str = ""
     url: str = ""
     screenshot: str = ""
+    uncertain: bool = False
+    verification_required: bool = False

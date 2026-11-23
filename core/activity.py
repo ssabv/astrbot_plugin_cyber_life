@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,8 @@ class DayStats:
     next_comment_at: str = ""
     next_reply_at: str = ""
     next_draw_at: str = ""
+    auto_comment_jobs: list[str] = field(default_factory=list)
+    auto_reply_jobs: list[str] = field(default_factory=list)
 
     def public(self, limits: dict[str, Any]) -> dict[str, Any]:
         watch_limit = int(limits.get("daily_watch_minutes", 60)) * 60
@@ -84,6 +87,7 @@ class ActivityEngine:
         data_dir: Path,
         notify: Callable[[str, Path | None], Awaitable[None]],
         request_login: Callable[[], Awaitable[None]] | None = None,
+        writer=None,
     ) -> None:
         self.settings = settings
         self.accounts = accounts
@@ -95,6 +99,10 @@ class ActivityEngine:
         self.data_dir = data_dir
         self.notify = notify
         self.request_login = request_login
+        self.writer = writer
+        self.tieba_actions = None
+        self.auto_comment: dict[str, Any] = {}
+        self.auto_reply: dict[str, Any] = {}
         self.state_path = data_dir / "activity.json"
         self.days: dict[str, DayStats] = {}
         self.threads: list[dict[str, Any]] = []
@@ -106,9 +114,12 @@ class ActivityEngine:
         self._busy = False
         self._pending_manual = False
         self._paused = False
+        self.browser_verification = {}
+        self.browser_uncertain_targets = []
         self._manual_until: datetime | None = None
         self._loop_task: asyncio.Task | None = None
         self._platform_cursor = 0
+        self._reply_platform_cursor = 0
         self._manual_platforms: list[str] = []
         self._last_login_prompt_at: datetime | None = None
         self._load()
@@ -128,6 +139,29 @@ class ActivityEngine:
         self.last_error = str(raw.get("last_error") or "")
         self.last_action = str(raw.get("last_action") or "")
         self.last_action_at = str(raw.get("last_action_at") or "")
+        self.auto_comment = raw.get("auto_comment") or {}
+        self.auto_reply = raw.get("auto_reply") or {}
+        stale_notice = False
+        for action in (self.auto_comment, self.auto_reply):
+            if action.get("state") == "uncertain" and "已保留浏览器供核对" in action.get("message", ""):
+                action["message"] = "发送结果尚未确认，本轮结束；后续活动继续，该目标不自动重发"
+                stale_notice = True
+            elif action.get("state") == "waiting_verification":
+                action.update(state="error", reason="error", message="旧等待已解除，本轮结束；后续活动继续")
+                stale_notice = True
+
+        self.browser_uncertain_targets = raw.get("browser_uncertain_targets") or []
+        old_waits = raw.get("browser_verification") or {}
+        self.browser_verification = {}
+        for key, record in old_waits.items():
+            if record.get("uncertain") and record.get("url"):
+                target = f"{key}:{record['url']}"
+                if target not in self.browser_uncertain_targets:
+                    self.browser_uncertain_targets.append(target)
+        if old_waits:
+            self.last_error = "旧浏览器等待已解除，后续活动继续；结果未知的目标不自动重发"
+        if old_waits or stale_notice:
+            self.save()
 
     def save(self) -> None:
         keep = self.settings.int("keep_activity_days")
@@ -144,6 +178,10 @@ class ActivityEngine:
                 "last_error": self.last_error,
                 "last_action": self.last_action,
                 "last_action_at": self.last_action_at,
+                "auto_comment": self.auto_comment,
+                "auto_reply": self.auto_reply,
+                "browser_verification": self.browser_verification,
+                "browser_uncertain_targets": self.browser_uncertain_targets,
             },
         )
 
@@ -253,6 +291,30 @@ class ActivityEngine:
             return 0
         return max(0, int((self._manual_until - now).total_seconds() // 60))
 
+    def record_browser_outcome(self, platform, account_name, message, *, uncertain=False, url=""):
+        key = f"{platform}:{account_name}"
+        if uncertain and url:
+            target = f"{key}:{url}"
+            if target not in self.browser_uncertain_targets:
+                self.browser_uncertain_targets.append(target)
+        self.last_error = message
+        self.save()
+
+    def clear_browser_verification(self, platform, account_name, job_id):
+        key = f"{platform}:{account_name}"
+        record = self.browser_verification.get(key)
+        if self._busy:
+            raise ValueError("已有任务正在执行，请稍后恢复")
+        if not record or record.get("job_id") != job_id:
+            raise ValueError("验证记录已变化，请刷新后重试")
+        account = self.accounts.active_account(platform)
+        if not account or account.name != account_name or account.status != "logged_in":
+            raise ValueError("请先登录并选中该账号")
+        self.browser_verification.pop(key)
+        # Unknown submissions retain their target reservation after release.
+        self.last_error = ""
+        self.save()
+
     def pause(self) -> None:
         self._paused = True
         self._manual_until = None
@@ -307,6 +369,15 @@ class ActivityEngine:
             if force:
                 # An explicit "去贴吧/小黑盒刷一会儿" must not wait for the
                 # normal browse interval; otherwise it looks like nothing ran.
+                if not self.settings.bool("browse_enabled"):
+                    if self._independent_tieba_comments() and self._comment_due(stats, now):
+                        await self._tieba_comment_round(stats, now)
+                    elif self._reply_due(stats, now) and self._reply_quota(stats):
+                        await self._reply_round(stats, now)
+                    else:
+                        self.current = "自动刷帖已关闭，且评论/回复未到时间"
+                    self.save()
+                    return
                 targets = [
                     name for name in self._manual_platforms
                     if name in self._eligible_platforms()
@@ -321,9 +392,11 @@ class ActivityEngine:
                     self.current = "今天的使用时间已经用完了"
                 self.save()
                 return
-            if self._reply_due(stats, now) and self._reply_quota(stats):
+            if self._independent_tieba_comments() and self._comment_due(stats, now):
+                await self._tieba_comment_round(stats, now)
+            elif self._reply_due(stats, now) and self._reply_quota(stats):
                 await self._reply_round(stats, now)
-            elif self._watch_quota(stats, now) and self._is_due(stats.next_watch_at, now):
+            elif self.settings.bool("browse_enabled") and self._watch_quota(stats, now) and self._is_due(stats.next_watch_at, now):
                 await self._watch_round(stats, now)
             elif self._draw_quota(stats) and self._is_due(stats.next_draw_at, now):
                 await self._draw_round(stats, now)
@@ -371,7 +444,7 @@ class ActivityEngine:
     def _reply_due(self, stats: DayStats, now: datetime) -> bool:
         return bool(
             self.settings.bool("reply_enabled")
-            and self.threads
+            and (self.threads or self._independent_tieba_comments())
             and self._is_due(stats.next_reply_at, now)
         )
 
@@ -381,6 +454,88 @@ class ActivityEngine:
             and stats.comments < self.settings.int("max_comments_per_day")
             and self._is_due(stats.next_comment_at, now)
         )
+
+    def _independent_tieba_comments(self) -> bool:
+        return bool(self.tieba_actions is not None and self.settings.bool("writer_enabled")
+                    and self.settings.list("tieba_forums") and "tieba" in self._eligible_platforms())
+
+    def _tieba_comment_status(self, stats: DayStats, now: datetime) -> dict:
+        return self._tieba_action_status("comment", stats, now)
+
+    def _tieba_action_status(self, kind: str, stats: DayStats, now: datetime) -> dict:
+        counter = "comments" if kind == "comment" else "replies"
+        account = self.accounts.active_account("tieba")
+        waiting = bool(account and self.tieba_actions is not None and self.tieba_actions.is_waiting(account.name))
+        independent = self._independent_tieba_comments() or waiting
+        if waiting:
+            gate = "verification_required"
+        elif not independent or not self.settings.bool(f"{kind}_enabled"):
+            gate = "disabled"
+        elif not self.running or not self.settings.can_call(now):
+            gate = "paused"
+        elif getattr(stats, counter) >= self.settings.int(f"max_{counter}_per_day"):
+            gate = "daily_limit"
+        elif not self._is_due(getattr(stats, f"next_{kind}_at"), now):
+            gate = "waiting"
+        else:
+            gate = "due"
+        return {**getattr(self, f"auto_{kind}"), "independent": independent, "gate": gate,
+                "next_at": getattr(stats, f"next_{kind}_at")}
+
+    def account_auto_action(self, job: dict) -> None:
+        """Reconcile acknowledged automatic sends once, including after reload."""
+        kind = job.get("kind")
+        if (kind not in {"comment", "reply"} or job.get("source") != "automatic"
+                or not job.get("ok")
+                or not (job.get("sent_pid") or job.get("verified"))):
+            return
+        sent_at = datetime.fromisoformat(job.get("sent_at") or job["at"])
+        stats = self.stats(sent_at)
+        counter = "comments" if kind == "comment" else "replies"
+        jobs = getattr(stats, f"auto_{kind}_jobs")
+        if job["id"] not in jobs:
+            jobs.append(job["id"])
+            setattr(stats, counter, getattr(stats, counter) + 1)
+            setattr(stats, f"last_{kind}_at", sent_at.isoformat(timespec="seconds"))
+            self._set_next(stats, f"next_{kind}_at", sent_at,
+                           self.settings.int(f"{kind}_interval_min"), self.settings.int(f"{kind}_interval_max"))
+            self.save()
+
+    async def _tieba_comment_round(self, stats: DayStats, now: datetime) -> None:
+        """One probability draw and at most one acknowledged Tieba comment."""
+        await self._tieba_action_round("comment", stats, now)
+
+    async def _tieba_action_round(self, kind: str, stats: DayStats, now: datetime) -> None:
+        label = "评论" if kind == "comment" else "回复"
+        state = {"at": now.isoformat(timespec="seconds"), "platform": "tieba"}
+        try:
+            if kind == "comment" and random.random() >= self.settings.float("comment_probability"):
+                state.update(state="skipped", reason="probability", message="本次评论抽签未中，等待下次")
+                return
+            self.current = "检查贴吧最新帖子并评论一条" if kind == "comment" else "检查贴吧回复我的消息"
+            job, created = self.tieba_actions.start(kind, "auto_" + uuid.uuid4().hex, automatic=True)
+            if created:
+                await self.tieba_actions.run(job["id"])
+            state.update(state=job["state"], reason=job["state"], message=job.get("message", ""),
+                         title=job.get("thread", {}).get("title", ""), pid=job.get("sent_pid", ""))
+            if job["state"] in {"error", "uncertain"}:
+                self.last_error = job.get("message", f"自动{label}未完成")
+        except asyncio.CancelledError:
+            state.update(state="interrupted", reason="cancelled", message=f"自动{label}中断，已提交的目标不会重发")
+            raise
+        except Exception as exc:
+            state.update(state="error", reason=type(exc).__name__, message=f"自动{label}准备失败，请查看日志")
+            self.last_error = state["message"]
+            logger.warning("[cyber-life] auto_%s platform=tieba error_type=%s", kind, type(exc).__name__)
+        finally:
+            self._set_next(stats, f"next_{kind}_at", now,
+                           self.settings.int(f"{kind}_interval_min"), self.settings.int(f"{kind}_interval_max"))
+            state["next_at"] = getattr(stats, f"next_{kind}_at")
+            setattr(self, f"auto_{kind}", state)
+            self.current = state.get("message", f"贴吧自动{label}结束")
+            self.save()
+            logger.info("[cyber-life] auto_%s platform=tieba state=%s reason=%s pid=%s next=%s",
+                        kind, state.get("state"), state.get("reason"), state.get("pid", ""), state["next_at"])
 
     def _phase_multiplier(self, now: datetime) -> float:
         return self.settings.interval_multiplier(now)
@@ -406,6 +561,12 @@ class ActivityEngine:
                 continue
             account = self.accounts.active_account(name)
             if account and account.status == "logged_in":
+                if self.browser.takeovers.has_account(name, account.name):
+                    continue
+                if f"{name}:{account.name}" in self.browser_verification:
+                    continue
+                if name == "tieba" and self.tieba_actions is not None and self.tieba_actions.is_waiting(account.name):
+                    continue
                 result.append(name)
         return result
 
@@ -424,6 +585,10 @@ class ActivityEngine:
             adapter = make_platform(platform_name, self.accounts, self.browser)
             posts = await adapter.feed(12)
         except Exception as exc:  # noqa: BLE001
+            if getattr(exc, "verification_required", False):
+                account = self.accounts.active_account(platform_name)
+                if account:
+                    self.record_browser_outcome(platform_name, account.name, str(exc))
             self.last_error = f"{platform_name} 刷帖失败：{exc}"
             logger.warning("[cyber-life] %s", self.last_error)
             self.history.append({"at": now.isoformat(timespec="seconds"), "kind": "error", "text": self.last_error})
@@ -498,7 +663,8 @@ class ActivityEngine:
         self.last_error = insight.error or ""
         self.current = "刚看完一个视频" if platform_name == "bilibili" else "刚看完一个帖子"
 
-        if self._comment_due(stats, now) and random.random() < self.settings.float("comment_probability"):
+        if (not (platform_name == "tieba" and self._independent_tieba_comments())
+                and self._comment_due(stats, now) and random.random() < self.settings.float("comment_probability")):
             await self._comment_on(post, adapter, insight, stats, now)
         else:
             if not stats.next_watch_at or self._is_due(stats.next_watch_at, now):
@@ -517,6 +683,14 @@ class ActivityEngine:
 
     # ------------------------------------------------------------------ reply
     async def _reply_round(self, stats: DayStats, now: datetime) -> None:
+        if self._independent_tieba_comments():
+            has_bilibili = "bilibili" in self._eligible_platforms() and any(
+                thread.get("platform") == "bilibili" for thread in self.threads)
+            choose_tieba = not has_bilibili or self._reply_platform_cursor % 2 == 0
+            self._reply_platform_cursor += 1
+            if choose_tieba:
+                await self._tieba_action_round("reply", stats, now)
+                return
         self.current = "看看有没有人回我"
         handled = False
         for thread in list(self.threads):
@@ -533,12 +707,15 @@ class ActivityEngine:
             for reply in replies:
                 if reply.is_self or reply.id in already or not reply.text.strip():
                     continue
-                text = await self._generate_reply(reply.author, reply.text)
+                text = await self._generate_reply(reply.author, reply.text, post=post, thread=thread)
                 if not text:
                     continue
                 result = await adapter.reply(post, str(thread.get("root_id", "")), reply.id, text)
                 if result.ok:
+                    self.last_error = ""
                     thread.setdefault("replied", []).append(reply.id)
+                    thread.setdefault("exchanges", []).append({"incoming": reply.text, "author": reply.author, "body": text})
+                    thread["exchanges"] = thread["exchanges"][-5:]
                     stats.replies += 1
                     stats.last_reply_at = now.isoformat(timespec="seconds")
                     self.last_action = f"回复了 {reply.author}：{shorten(text, 40)}"
@@ -577,6 +754,11 @@ class ActivityEngine:
 
     # ----------------------------------------------------------------- comment
     async def _comment_on(self, post: Post, adapter, insight: VideoInsight, stats: DayStats, now: datetime) -> None:
+        account = self.accounts.active_account(post.platform)
+        if account and f"{post.platform}:{account.name}:{post.url}" in self.browser_uncertain_targets:
+            self.current = "此目标的发送结果未知，不自动重发"
+            self._set_next(stats, "next_comment_at", now, self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"))
+            return
         haystack = " ".join([post.title, post.description, insight.summary, " ".join(insight.topics)])
         if any(word in haystack for word in UNSAFE_COMMENT_WORDS):
             self.current = "这个视频不适合评论，跳过了"
@@ -585,14 +767,6 @@ class ActivityEngine:
                 self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"),
             )
             return
-        text = await self._generate_comment(post, insight)
-        if not text:
-            self._set_next(
-                stats, "next_comment_at", now,
-                self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"),
-            )
-            return
-        self.current = f"在《{shorten(post.title, 26)}》下面评论"
         comments_context: list[dict[str, Any]] = []
         if hasattr(adapter, "comments"):
             try:
@@ -607,13 +781,41 @@ class ActivityEngine:
                         )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"[cyber-life] 读取评论区失败：{exc}")
+        text = await self._generate_comment(post, insight, comments_context)
+        if not text:
+            self._set_next(
+                stats, "next_comment_at", now,
+                self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"),
+            )
+            return
+        self.current = f"在《{shorten(post.title, 26)}》下面评论"
+        browser_target = f"{post.platform}:{account.name}:{post.url}" if account and post.platform in {"tieba", "xiaoheihe"} else ""
+        if browser_target:
+            # Persist before awaiting a write. A crash must not make this target eligible again.
+            self.record_browser_outcome(post.platform, account.name, "发送操作尚未确认；后续活动继续，该目标不自动重发", uncertain=True, url=post.url)
         try:
             result = await adapter.comment(post, text)
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"评论失败：{exc}"
             logger.warning("[cyber-life] 评论失败《%s》：%s", shorten(post.title, 80), exc)
+            if browser_target and not getattr(exc, "uncertain", True) and browser_target in self.browser_uncertain_targets:
+                self.browser_uncertain_targets.remove(browser_target)
+            self._set_next(stats, "next_comment_at", now, self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"))
+            self.save()
+            return
+        if browser_target and not getattr(result, "uncertain", False):
+            self.browser_verification.pop(f"{post.platform}:{account.name}", None)
+            if browser_target in self.browser_uncertain_targets:
+                self.browser_uncertain_targets.remove(browser_target)
+            self.save()
+        if getattr(result, "verification_required", False) or getattr(result, "uncertain", False):
+            if account:
+                self.record_browser_outcome(post.platform, account.name, result.message + "；本轮结束，后续活动继续",
+                    uncertain=getattr(result, "uncertain", False), url=post.url)
+            self._set_next(stats, "next_comment_at", now, self.settings.int("comment_interval_min"), self.settings.int("comment_interval_max"))
             return
         if result.ok:
+            self.last_error = ""
             stats.comments += 1
             stats.last_comment_at = now.isoformat(timespec="seconds")
             self.last_action = f"评论了《{shorten(post.title, 36)}》"
@@ -638,12 +840,15 @@ class ActivityEngine:
                             "platform": "bilibili",
                             "id": post.id,
                             "title": post.title,
+                            "description": post.description,
                             "url": post.url,
                             "aid": post.aid,
                             "bvid": post.bvid,
                             "cid": post.cid,
                         },
                         "root_id": result.id,
+                        "own_comment": text,
+                        "exchanges": [],
                         "replied": [],
                         "created": now.isoformat(timespec="seconds"),
                     }
@@ -743,8 +948,15 @@ class ActivityEngine:
         return themes.get(card["label"], "a dreamy quiet landscape, soft light, detailed")
 
     # ------------------------------------------------------------------- text
-    async def _generate_comment(self, post: Post, insight: VideoInsight) -> str:
+    async def _generate_comment(self, post: Post, insight: VideoInsight, comments: list | None = None) -> str:
         max_chars = max(10, self.settings.int("comment_max_chars"))
+        if self.settings.bool("writer_enabled"):
+            return await self._write("comment", {
+                "platform": post.platform, "title": post.title, "author": post.author,
+                "content": post.description, "observed_summary": insight.summary,
+                "transcript": shorten(insight.transcript, 1200), "topics": insight.topics,
+                "comments": comments or [], "mood": self.mood.style_hint(),
+            }, max_chars)
         if self.llm.available:
             style = self.mood.style_hint()
             speech = shorten(insight.transcript, 1200)
@@ -771,8 +983,15 @@ class ActivityEngine:
         key = "positive" if insight.sentiment > 0.15 else "negative" if insight.sentiment < -0.15 else "neutral"
         return self._clean_comment(f"{templates[key]}（{shorten(post.title, 18)}）", max_chars)
 
-    async def _generate_reply(self, author: str, text: str) -> str:
+    async def _generate_reply(self, author: str, text: str, *, post: Post | None = None, thread: dict | None = None) -> str:
         max_chars = max(8, self.settings.int("reply_max_chars"))
+        if self.settings.bool("writer_enabled"):
+            thread = thread or {}
+            return await self._write("reply", {
+                "platform": post.platform if post else "", "title": post.title if post else "",
+                "content": post.description if post else "", "own_comment": thread.get("own_comment", ""),
+                "previous_exchanges": thread.get("exchanges", [])[-5:], "author": author, "incoming": text,
+            }, max_chars)
         if self.llm.available:
             prompt = (
                 f"有人在你视频的评论下回复：{text}\n"
@@ -782,6 +1001,16 @@ class ActivityEngine:
             if result:
                 return self._clean_comment(result, max_chars)
         return self._clean_comment("谢谢回复，看到啦～", max_chars)
+
+    async def _write(self, kind: str, material: dict, max_chars: int) -> str:
+        if self.writer is None:
+            self.last_error = "写稿器不可用，本轮不发送"
+            return ""
+        result = await self.writer.draft(kind=kind, material=material, max_chars=max_chars)
+        if not result.ok:
+            self.last_error = f"写稿失败（{result.error}），本轮不发送"
+            return ""
+        return result.body
 
     @staticmethod
     def _clean_comment(text: str, max_chars: int) -> str:
@@ -799,6 +1028,7 @@ class ActivityEngine:
             platform=str(data.get("platform") or "bilibili"),
             id=str(data.get("id") or ""),
             title=str(data.get("title") or ""),
+            description=str(data.get("description") or ""),
             url=str(data.get("url") or ""),
             aid=str(data.get("aid") or ""),
             bvid=str(data.get("bvid") or ""),
@@ -929,6 +1159,7 @@ class ActivityEngine:
             "effective_running": self.running and schedule.can_act(now),
             "paused": self._paused,
             "busy": self._busy,
+            "browser_verification": list(self.browser_verification.values()),
             "phase": phase.value,
             "phase_label": phase.label,
             "holiday_name": self.settings.holidays.name_for(now),
@@ -950,6 +1181,8 @@ class ActivityEngine:
             "last_action": self.last_action,
             "last_action_at": self.last_action_at,
             "last_error": self.last_error,
+            "auto_comment": self._tieba_comment_status(stats, now),
+            "auto_reply": self._tieba_action_status("reply", stats, now),
             "today": stats.public(limits),
             "limits": limits,
             "history": self.history[-40:][::-1],

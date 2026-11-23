@@ -1,3 +1,4 @@
+import { setupTakeover } from "./takeover.js";
 const bridge = window.AstrBotPluginView;
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -16,7 +17,9 @@ const state = {
   loginTimer: null,
   toastTimer: null,
   tab: "overview",
+  manualPending: false,
 };
+const takeover = setupTakeover(bridge, toast, () => loadOverview(true));
 
 function toast(message, isError = false) {
   const box = $("#toast");
@@ -89,10 +92,28 @@ function renderOverview(data) {
   setText("#auto-phase-label", scheduleLabel);
 
   renderMood(mood);
-  renderStats(today, settings, status);
+  renderStats(today, settings, status, data.manual_actions || {});
+  renderManualAction(data.manual_actions || {}, status);
+  renderVerification([...(data.manual_actions?.verification || []), ...(status.browser_verification || [])]);
+  takeover.render(data.browser_takeovers || [], data.manual_actions?.verification || []);
   renderPlatformChips(data.platforms || [], status.platforms || []);
   renderDeps(data.dependencies || {});
   renderNextTimes(today);
+  const automatic = status.auto_comment || {};
+  const autoEnabled = settings.comment_enabled && settings.writer_enabled && (status.platforms || []).includes("tieba")
+    && (settings.tieba_forums || []).length;
+  const autoMessage = automatic.message ? `上次：${automatic.message}。` : "";
+  const autoGate = {waiting: "等待下次评论时间", due: "已到时间，等待调度", paused: "当前暂停或不在活动时间",
+    verification_required: "等待验证处理", daily_limit: "今日评论额度已用完"}[automatic.gate] || "";
+  setText("#auto-comment-status", autoEnabled
+    ? `贴吧自动评论：${autoGate ? autoGate + "。" : ""}${autoMessage}按评论时间独立检查最新帖子，抽中才写稿。概率 ${Math.round((settings.comment_probability || 0) * 100)}%，峰时会延长间隔，每日额度仍有效。`
+    : "");
+  const reply = status.auto_reply || {};
+  const replyGate = {waiting: "等待下次检查时间", due: "已到时间，等待调度", paused: "当前暂停或不在活动时间",
+    verification_required: "等待验证处理", daily_limit: "今日回复额度已用完"}[reply.gate] || "";
+  setText("#auto-reply-status", reply.independent && settings.reply_enabled
+    ? `贴吧自动回复：${replyGate ? replyGate + "。" : ""}${reply.message ? "上次：" + reply.message + "。" : ""}按回复间隔检查“回复我的”，从最新开始，每轮最多一条；已处理、自己的消息及其他吧会跳过，没有新消息不写稿。`
+    : "");
   renderTimeline(status.history || []);
   renderAccounts(data.accounts || [], data.platforms || []);
   renderPlatformList(data.platforms || []);
@@ -103,6 +124,57 @@ function renderOverview(data) {
   }
   const errorText = status.last_error ? String(status.last_error) : "";
   setText("#error-text", errorText ? `⚠ ${errorText.slice(0, 80)}` : "");
+}
+
+function renderVerification(records) {
+  const box = $("#verification-waits");
+  box.replaceChildren();
+  for (const record of records) {
+    const row = document.createElement("div");
+    row.className = "reasons";
+    const text = document.createElement("p");
+    text.textContent = `${PLATFORM_META[record.platform]?.label || record.platform} / ${record.account_name}：${record.message || "等待验证处理"}${record.uncertain ? "；发送结果未知，原目标不会自动重发" : ""}`;
+    row.append(text);
+    if (record.platform === "tieba") {
+      const takeButton = document.createElement("button");
+      takeButton.className = "btn";
+      takeButton.textContent = "人工接管浏览器";
+      takeButton.addEventListener("click", () => takeover.open(record));
+      row.append(takeButton);
+    }
+    if (record.url) {
+      try {
+        const url = new URL(record.url);
+        if (url.protocol === "https:") {
+          const link = document.createElement("a");
+          link.href = url.href;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = record.type === "confirmation" ? "查看原页面" : "查看验证或原页面";
+          row.append(link);
+        }
+      } catch (_) {}
+    }
+    const button = document.createElement("button");
+    button.className = "btn";
+    button.textContent = record.type === "confirmation" ? "已核对发送结果，恢复该账号" : "已处理验证，恢复该账号";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const result = await bridge.apiPost("verification/release", {
+          platform: record.platform, account_name: record.account_name,
+          job_id: record.job_id, processed: true,
+        });
+        toast(result.message || "已恢复，按原计划重新检查");
+        await loadOverview();
+      } catch (error) {
+        toast(error.message, true);
+        button.disabled = false;
+      }
+    });
+    row.append(button);
+    box.append(row);
+  }
 }
 
 function renderMood(mood) {
@@ -196,13 +268,13 @@ function drawSpark(history) {
   ctx.fill();
 }
 
-function renderStats(today, settings, status) {
+function renderStats(today, settings, status, manual) {
   const watchMinutes = (Number(today.watch_seconds) || 0) / 60;
   setText("#watch-value", `${Math.round(watchMinutes)}`);
   $("#watch-value").append(el("small", "", "分"));
-  setText("#comment-value", String(today.comments ?? 0));
+  setText("#comment-value", String((today.comments || 0) + (manual.manual_comments || 0)));
   $("#comment-value").append(el("small", "", "条"));
-  setText("#reply-value", String(today.replies ?? 0));
+  setText("#reply-value", String((today.replies || 0) + (manual.manual_replies || 0)));
   $("#reply-value").append(el("small", "", "条"));
   setText("#draw-value", String(today.draws ?? 0));
   $("#draw-value").append(el("small", "", "张"));
@@ -225,6 +297,23 @@ function renderStats(today, settings, status) {
   setText("#now-text", nowText);
 }
 
+function renderManualAction(manual, status) {
+  const job = manual.current || {};
+  const busy = state.manualPending || status.busy || ["running", "submitting"].includes(job.state);
+  $("#comment-once-btn").disabled = Boolean(busy);
+  $("#reply-once-btn").disabled = Boolean(busy);
+  const box = $("#manual-action-result");
+  box.replaceChildren();
+  box.append(el("p", "muted", `今日手动：评论 ${manual.manual_comments || 0} 条，回复 ${manual.manual_replies || 0} 条。进度条统计自动额度。`));
+  if (!job.id) return;
+  box.append(el("p", "", `${job.kind === "reply" ? "立即回复" : "立即评论"}：${job.message || job.stage || job.state}`));
+  if (job.thread?.title) box.append(el("p", "muted", `目标：${job.thread.title}`));
+  if (job.incoming?.content) box.append(el("p", "muted", `对方：${job.incoming.content}`));
+  if (job.body) box.append(el("p", "", `正文：${job.body}`));
+  if (job.sent_pid) box.append(el("p", "muted", `贴吧回复编号：${job.sent_pid}`));
+  for (const reason of job.skipped_reasons || []) box.append(el("p", "muted", reason));
+}
+
 function renderPlatformChips(platforms, eligible) {
   const box = $("#platform-chips");
   box.replaceChildren();
@@ -242,8 +331,10 @@ function renderDeps(deps) {
   const box = $("#deps");
   box.replaceChildren();
   const asr = deps.asr || {};
+  const fullChromium = deps.browser_executables?.some(path => !/headless[-_]shell/.test(path));
   const items = [
     ["Playwright", deps.playwright, deps.playwright ? "已安装" : "未安装，需 pip install"],
+    ["Chromium", Boolean(fullChromium), fullChromium ? "完整浏览器已安装" : deps.browser_executables?.length ? "仅有旧无头运行时" : "浏览器文件未安装"],
     ["二维码", deps.qrcode, deps.qrcode ? "可用" : "缺少 qrcode"],
     ["ffmpeg", deps.ffmpeg, deps.ffmpeg ? "可用" : "缺少，视频抽帧不可用"],
     ["视觉模型", deps.llm, deps.llm ? "已连接" : "未配置，会退回标题推断"],
@@ -251,11 +342,32 @@ function renderDeps(deps) {
     ["语音模型", asr.model_ready, asr.model_ready ? `${asr.model} 已下载` : "首次听写时下载"],
     ["ComfyUI", deps.comfyui_configured, deps.comfyui_configured ? "已配置" : "未启用"],
   ];
+  $("#install-browser-btn").hidden = !deps.playwright || Boolean(fullChromium);
   for (const [name, ok, hint] of items) {
     const node = el("div", `dep ${ok ? "ok" : "bad"}`);
     node.append(el("b", "", name));
     node.append(el("span", "", hint));
     box.append(node);
+  }
+}
+
+async function installBrowser() {
+  const button = $("#install-browser-btn");
+  button.disabled = true;
+  setText("#browser-install-status", "正在安装 Chromium…");
+  try {
+    let result = await bridge.apiPost("browser/install", {});
+    for (let i = 0; result.state === "running" && i < 70; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      result = await bridge.apiGet("browser/install");
+    }
+    if (result.state !== "success") throw new Error(result.error || "安装仍在进行，请稍后刷新");
+    setText("#browser-install-status", "Chromium 已安装");
+    await loadOverview();
+  } catch (error) {
+    setText("#browser-install-status", `安装失败：${error.message}`);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -430,7 +542,7 @@ function fillSettings(settings, platforms) {
     const type = input.dataset.type;
     if (type === "bool") input.checked = Boolean(settings[key]);
     else if (type === "radio") input.checked = String(settings[key]) === input.value;
-    else if (type === "list") input.value = Array.isArray(settings[key]) ? settings[key].join(", ") : String(settings[key] || "");
+    else if (type === "list") input.value = Array.isArray(settings[key]) ? settings[key].join(key === "tieba_forums" ? "\n" : ", ") : String(settings[key] || "");
     else input.value = settings[key] ?? "";
   }
   platformChecks(platforms);
@@ -464,7 +576,7 @@ function collectSettings() {
     if (type === "bool") patch[key] = input.checked;
     else if (type === "int") patch[key] = Number.parseInt(input.value, 10) || 0;
     else if (type === "float") patch[key] = Number.parseFloat(input.value) || 0;
-    else if (type === "list") patch[key] = input.value.split(/[,，]/).map((part) => part.trim()).filter(Boolean);
+    else if (type === "list") patch[key] = input.value.split(key === "tieba_forums" ? /[,，\r\n]+/ : /[,，]/).map((part) => part.trim()).filter(Boolean);
     else patch[key] = input.value;
   }
   const selected = $$("#platform-checks input:checked").map((input) => input.value);
@@ -473,6 +585,58 @@ function collectSettings() {
 }
 
 /* ----------------------------------------------------------------- actions */
+
+async function loadWriterOptions() {
+  try {
+    const options = await bridge.apiGet("writer/options");
+    for (const key of ["writer_provider_id", "analysis_provider_id", "vision_provider_id", "writer_persona_id"]) {
+      const select = $(`[data-key='${key}']`);
+      const current = state.settings?.[key] || select.value;
+      const rows = key === "writer_persona_id" ? options.personas : options.providers;
+      for (const row of rows || []) {
+        if (!Array.from(select.options).some((item) => item.value === row.id)) {
+          const option = el("option", "", row.label);
+          option.value = row.id;
+          select.append(option);
+        }
+      }
+      if (current && !Array.from(select.options).some((item) => item.value === current)) {
+        const option = el("option", "", `${current}（当前不可用）`);
+        option.value = current;
+        select.append(option);
+      }
+      select.value = current;
+    }
+  } catch (error) {
+    toast(`模型列表读取失败：${error.message}`, true);
+  }
+}
+
+async function previewWriter() {
+  const button = $("#writer-preview-btn");
+  button.disabled = true;
+  setText("#writer-preview-status", "正在生成，最长等待写稿总超时…");
+  setText("#writer-preview-output", "");
+  try {
+    let result = await bridge.apiPost("writer/preview", {
+      kind: $("#writer-preview-kind").value,
+      title: $("#writer-preview-title").value,
+      content: $("#writer-preview-content").value,
+      own_comment: $("#writer-preview-own").value,
+      incoming: $("#writer-preview-incoming").value,
+    });
+    while (result.state === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      result = await bridge.apiGet(`writer/preview/${encodeURIComponent(result.id)}`);
+    }
+    setText("#writer-preview-output", result.ok ? result.body : `写稿失败：${result.error}`);
+    setText("#writer-preview-status", `仅预览 · ${result.provider_id || "未选模型"} · 人格 ${result.persona_id || "无"} · 记忆 ${result.memory?.status || "disabled"}（${result.memory?.count || 0}条） · ${result.elapsed_ms}ms`);
+  } catch (error) {
+    setText("#writer-preview-status", `预览失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
 
 function renderBalance(data) {
   const total = $("#balance-total");
@@ -672,6 +836,31 @@ async function runNow() {
   }
 }
 
+async function runOnce(kind) {
+  if (state.manualPending) return;
+  state.manualPending = true;
+  $("#comment-once-btn").disabled = true;
+  $("#reply-once-btn").disabled = true;
+  const requestId = `manual_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+  try {
+    let job = await bridge.apiPost("actions/start", { kind, request_id: requestId });
+    const deadline = Date.now() + 12 * 60 * 1000;
+    while (["running", "submitting"].includes(job.state)) {
+      renderManualAction({ ...(state.overview?.manual_actions || {}), current: job }, state.overview?.status || {});
+      if (Date.now() > deadline) throw Error("仍在后台执行，请刷新查看；不要重复提交");
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      job = await bridge.apiGet(`actions/status/${requestId}`);
+    }
+    toast(job.message || "任务结束", ["error", "uncertain"].includes(job.state));
+    await loadOverview(true);
+  } catch (error) {
+    toast(`请刷新核对任务状态：${error.message}`, true);
+  } finally {
+    state.manualPending = false;
+    await loadOverview(true);
+  }
+}
+
 async function stopNow() {
   try {
     await bridge.apiPost("stop", {});
@@ -703,17 +892,22 @@ function bindTabs() {
       state.tab = tab.dataset.tab;
       $$(".tab").forEach((item) => item.classList.toggle("active", item === tab));
       $$(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${state.tab}`));
+      if (state.tab === "takeover") takeover.poll();
     });
   }
 }
 
 function bindActions() {
   $("#refresh-btn").addEventListener("click", () => loadOverview());
+  $("#install-browser-btn").addEventListener("click", installBrowser);
   $("#run-btn").addEventListener("click", runNow);
+  $("#comment-once-btn").addEventListener("click", () => runOnce("comment"));
+  $("#reply-once-btn").addEventListener("click", () => runOnce("reply"));
   $("#stop-btn").addEventListener("click", stopNow);
   $("#draw-btn").addEventListener("click", drawNow);
   $("#balance-refresh").addEventListener("click", () => loadBalance(true));
   $("#settings-form").addEventListener("submit", saveSettings);
+  $("#writer-preview-btn").addEventListener("click", previewWriter);
   $("#modal-close").addEventListener("click", cancelLogin);
   $("#qr-cancel").addEventListener("click", cancelLogin);
   $("#qr-confirm").addEventListener("click", confirmLogin);
@@ -742,6 +936,7 @@ async function init() {
     return;
   }
   await loadOverview(true);
+  await loadWriterOptions();
   loadBalance();
   setInterval(() => {
     if (!document.hidden && !state.loginId) loadOverview(true);
