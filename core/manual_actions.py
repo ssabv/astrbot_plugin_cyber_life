@@ -190,6 +190,17 @@ class ManualActions:
         return [job for job in self.jobs.values() if job.get("ok") and job.get("uid") == uid
                 and job.get("thread", {}).get("tid") == tid]
 
+    async def _image_summary(self, *, title: str, body: str, images) -> str:
+        analyzer = getattr(self.engine, "analyzer", None)
+        if not images or not analyzer or not hasattr(analyzer, "analyze_images"):
+            return ""
+        try:
+            insight = await analyzer.analyze_images(title=title, body=body, images=list(images))
+            return insight.summary
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[cyber-life] 贴吧图片识别跳过 error_type=%s", type(exc).__name__)
+            return ""
+
     async def prepare(self, session, kind, uid):
         allowed = self.scope()
         skipped = []
@@ -209,21 +220,16 @@ class ManualActions:
                 content = thread["title"] + thread["body"]
                 if not thread["title"] or any(word in content for word in UNSAFE_COMMENT_WORDS):
                     continue
-                image_summary = ""
-                analyzer = getattr(self.engine, "analyzer", None)
-                if thread.get("images") and analyzer and hasattr(analyzer, "analyze_images"):
-                    try:
-                        insight = await analyzer.analyze_images(
-                            title=thread["title"], body=thread["body"], images=thread["images"])
-                        image_summary = insight.summary
-                    except Exception as exc:  # noqa: BLE001
-                        logger.info("[cyber-life] 贴吧图片识别跳过 error_type=%s", type(exc).__name__)
+                image_summary = await self._image_summary(
+                    title=thread["title"], body=thread["body"], images=thread.get("images") or [])
                 seen_key = "tieba:" + hashlib.sha1(thread["url"].encode("utf-8")).hexdigest()[:16]
+                comments = [{"author": row.get("author", ""), "content": row.get("content", "")}
+                            for row in thread["posts"][1:6]]
                 return {"key": key, "thread": thread, "target": None, "seen_key": seen_key,
                         "selection_order": "created_at_desc", "created_at": post["created_at"],
                         "material": {"platform": "tieba", "title": thread["title"], "content": thread["body"],
                                      "image_summary": image_summary,
-                                     "comments": thread["posts"][1:6]}}
+                                     "comments": comments}}
             return {"skip": "没有找到允许范围内尚未评论的合适帖子"}
         inbox = await session.inbox()
         for item in sorted(inbox, key=lambda row: row["created_at"], reverse=True):
@@ -263,9 +269,17 @@ class ManualActions:
                 skipped.append("楼中楼缺少作者信息")
                 continue
             actual_incoming = next((row for row in thread["posts"] if row["pid"] == pid and row["author_id"] == item["author_id"]), {})
+            incoming_text = actual_incoming.get("content") or item["content"]
+            body_image_summary = await self._image_summary(
+                title=thread["title"], body=thread["body"], images=thread.get("images") or [])
+            incoming_image_summary = await self._image_summary(
+                title=thread["title"], body=incoming_text,
+                images=actual_incoming.get("images") or [])
             return {"key": key, "thread": thread, "target": target, "incoming": item,
                     "material": {"platform": "tieba", "title": thread["title"], "content": thread["body"],
-                                 "incoming": actual_incoming.get("content") or item["content"], "author": item["author"],
+                                 "image_summary": body_image_summary,
+                                 "incoming": incoming_text, "author": item["author"],
+                                 "incoming_image_summary": incoming_image_summary,
                                  "incoming_is_notification_preview": not bool(actual_incoming.get("content")),
                                  "own_comment": own.get("content") or known.get("body", ""),
                                  "notification_quote_unverified": item["quote_content"],
