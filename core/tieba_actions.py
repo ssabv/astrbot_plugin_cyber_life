@@ -138,7 +138,10 @@ def image_urls(value) -> list[str]:
     for item in value[:100]:
         if not isinstance(item, dict) or (str(item.get("type", "2")) != "2" and "origin_src" not in item):
             continue
-        raw = str(item.get("origin_src") or item.get("big_src") or item.get("src") or item.get("c") or "")
+        raw = str(item.get("origin_src") or item.get("big_src") or item.get("big_cdn_src")
+                  or item.get("cdn_src") or item.get("src") or item.get("c")
+                  or item.get("big_pic") or item.get("small_pic") or item.get("origin_pic")
+                  or item.get("pic_url") or "")
         url = public_image_url(raw)
         if url and url not in result:
             result.append(url)

@@ -125,12 +125,16 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
             {"type": "0", "text": "看图"},
             {"type": "2", "origin_src": "http://tiebapic.baidu.com/forum/a.jpg?size=1"},
             {"type": "2", "src": "//imgsrc.baidu.com/forum/b.jpg"},
+            {"type": "2", "cdn_src": "https://tiebapic.baidu.com/forum/c.jpg"},
+            {"type": "2", "big_cdn_src": "https://tiebapic.baidu.com/forum/d.jpg"},
             {"type": "2", "src": "http://localhost/secret"},
             {"type": "2", "src": "http://user:pass@tiebapic.baidu.com/leak.jpg"},
         ] * 3
         urls = image_urls(content)
         self.assertEqual(urls, ["https://tiebapic.baidu.com/forum/a.jpg?size=1",
-                                "https://imgsrc.baidu.com/forum/b.jpg"])
+                                "https://imgsrc.baidu.com/forum/b.jpg",
+                                "https://tiebapic.baidu.com/forum/c.jpg",
+                                "https://tiebapic.baidu.com/forum/d.jpg"])
 
     async def test_tieba_images_are_described_by_vision_provider(self):
         self.llm = types.SimpleNamespace(
