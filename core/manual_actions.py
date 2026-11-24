@@ -235,6 +235,21 @@ class ManualActions:
                             "content": row.get("content", ""), "images": len(row.get("images") or [])})
         return context
 
+    def _same_floor_comments(self, thread: dict, parent: str, exclude: set[str], limit: int = 5) -> list[dict]:
+        """Summarize other replies inside the target floor without raw media URLs."""
+        rows = {str(row.get("pid", "")): row for row in thread.get("posts", []) if positive(row.get("pid"))}
+        comments = (rows.get(str(parent or "")) or {}).get("comments") or []
+        result = []
+        for row in comments:
+            pid = str(row.get("pid", ""))
+            content = str(row.get("content", "")).strip()
+            if not content or pid in exclude:
+                continue
+            result.append({"author": row.get("author", ""), "content": content})
+            if len(result) >= limit:
+                break
+        return result
+
     async def _image_summary(self, *, title: str, body: str, images) -> str:
         analyzer = getattr(self.engine, "analyzer", None)
         if not images or not analyzer or not hasattr(analyzer, "analyze_images"):
@@ -274,6 +289,15 @@ class ManualActions:
                     rows[extra_pid] = row
         own = next((row for row in thread.get("posts", [])
                     if row["pid"] == quote_pid and row.get("author_id") == uid), {})
+        reader = getattr(session, "floor_comments", None)
+        if item.get("is_floor") and positive(parent) and callable(reader):
+            try:
+                comments = await reader(tid, parent, limit=8)
+                if rows.get(parent) is not None:
+                    rows[parent]["comments"] = comments
+                thread["floor_comments"] = comments
+            except Exception as exc:  # noqa: BLE001
+                logger.info("[cyber-life] 同楼层评论读取失败 parent=%s error_type=%s", parent, type(exc).__name__)
         return thread, own, known, parent
 
     async def prepare(self, session, kind, uid):
@@ -345,10 +369,13 @@ class ManualActions:
                 images=actual_incoming.get("images") or [])
             quote_pid = str(item.get("quote_pid") or "")
             floor_context = self._reply_floor_context(thread, item, pid, uid, quote_pid, parent, known)
+            same_floor_comments = self._same_floor_comments(
+                thread, parent, {str(pid), quote_pid})
             logger.info("[cyber-life] 贴吧识图材料 tid=%s incoming_pid=%s main_images=%s context_images=%s target_images=%s floor_context=%s",
                         tid, pid, len(thread.get("images") or []),
                         len(self._reply_context_images(thread, item, parent, known)),
-                        len(actual_incoming.get("images") or []), len(floor_context))
+                        len(actual_incoming.get("images") or []),
+                        len(floor_context), len(same_floor_comments))
             return {"key": key, "thread": thread, "target": target, "incoming": item,
                     "material": {"platform": "tieba", "title": thread["title"], "content": thread["body"],
                                  "image_summary": body_image_summary,
@@ -356,6 +383,7 @@ class ManualActions:
                                  "context_image_summary": context_image_summary,
                                  "incoming_image_summary": incoming_image_summary,
                                  "floor_context": floor_context,
+                                 "same_floor_comments": same_floor_comments,
                                  "incoming_is_notification_preview": not bool(actual_incoming.get("content")),
                                  "own_comment": own.get("content") or known.get("body", ""),
                                  "notification_quote_unverified": item["quote_content"],

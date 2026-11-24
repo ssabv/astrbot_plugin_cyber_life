@@ -230,6 +230,22 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
         self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")
 
+    async def test_tieba_reply_includes_same_floor_comments(self):
+        self.prepare_reply()
+        self.incoming["is_floor"] = True
+        self.session.floor_comments = AsyncMock(return_value=[
+            {"pid": "105", "author": "路人", "content": "我也这么觉得"},
+            {"pid": "103", "author": "群友", "content": "是啊还有一堆"},
+            {"pid": "102", "author": "群友", "content": "还没忙完啊"},
+        ])
+
+        await self.engine.tick()
+
+        self.session.floor_comments.assert_awaited_once_with("123", "102", limit=8)
+        material = self.writer.draft.await_args.kwargs["material"]
+        self.assertEqual(material["same_floor_comments"],
+                         [{"author": "路人", "content": "我也这么觉得"}])
+
     async def test_writer_failure_keeps_quota_and_records_reason(self):
         self.writer.draft.return_value = DraftResult(error="TimeoutError")
         await self.engine.tick()

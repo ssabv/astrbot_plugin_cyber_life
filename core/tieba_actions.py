@@ -289,6 +289,38 @@ def parse_submission(payload: bytes) -> str:
     return str(int(pid))
 
 
+def parse_floor_comments(payload: bytes, *, limit: int = 8) -> list[dict]:
+    """Parse one floor's bounded sub-comments from the verified floor response."""
+    outer = fields(payload)
+    error = message(outer, 1)
+    check_error(integer(error, 1), string(error, 2))
+    data = message(outer, 2)
+    rows = []
+    for number, wire, value in data:
+        if number != 4 or wire != 2:
+            continue
+        item = fields(value)
+        pid = str(integer(item, 1))
+        if not positive(pid):
+            continue
+        author = message(item, 7)
+        text_parts = []
+        for fragment_no, fragment_wire, fragment_value in item:
+            if fragment_no != 2 or fragment_wire != 2:
+                continue
+            fragment = fields(fragment_value)
+            if str(integer(fragment, 1)) in {"0", "4"}:
+                text_parts.append(string(fragment, 2))
+        rows.append({"pid": pid, "floor": str(integer(item, 6)),
+                     "author_id": str(integer(author, 2) or integer(item, 4)),
+                     "author": string(author, 4) or string(author, 3),
+                     "portrait": string(author, 5),
+                     "content": "".join(text_parts)[:12000]})
+        if len(rows) >= max(1, min(limit, 20)):
+            break
+    return rows
+
+
 class TiebaSession:
     def __init__(self, browser, account_name: str):
         self.browser, self.account_name = browser, account_name
@@ -425,6 +457,19 @@ class TiebaSession:
             return parse_inbox(raw)
         except (ValueError, UnicodeError):
             raise TiebaActionError("贴吧消息接口格式无法识别，本次不发送") from None
+
+    async def floor_comments(self, tid: str, parent_pid: str, *, limit: int = 8) -> list[dict]:
+        """Read one floor's sub-comments; the caller decides how much context to use."""
+        if not positive(tid) or not positive(parent_pid):
+            raise TiebaActionError("楼层编号无效")
+        common = pb_int(1, 2) + pb_str(2, "22.12.1.0") + pb_str(10, self.bduss)
+        payload = pb_bytes(1, pb_int(1, int(tid)) + pb_int(2, int(parent_pid))
+                           + pb_int(4, 1) + pb_bytes(9, common))
+        raw = await self._request("https://tiebac.baidu.com/c/f/pb/floor?cmd=302002", multipart=payload)
+        try:
+            return parse_floor_comments(raw, limit=limit)
+        except (ValueError, UnicodeError):
+            raise TiebaActionError("贴吧楼中楼接口格式无法识别，本次不发送") from None
 
     async def latest_threads(self, forums: list[str], limit: int = 30) -> list[dict]:
         """Read the new-post tab and order by publication, never reply activity."""
