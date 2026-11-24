@@ -201,6 +201,40 @@ class ManualActions:
                     images.append(url)
         return images[:3]
 
+    def _reply_floor_context(self, thread: dict, item: dict, incoming_pid: str, uid: str,
+                             quote_pid: str, parent: str, known: dict) -> list[dict]:
+        """Give the writer nearby floors instead of the raw post list."""
+        rows = [row for row in thread.get("posts", [])
+                if positive(row.get("pid")) and str(row.get("floor", "")) != "1"]
+        if not rows:
+            return []
+        try:
+            rows.sort(key=lambda row: int(row.get("floor") or 0))
+        except (TypeError, ValueError):
+            pass
+        relevant = {str(incoming_pid or ""), str(quote_pid or ""), str(parent or ""),
+                    str((known.get("target") or {}).get("parent_pid") or "")}
+        indexes = [index for index, row in enumerate(rows) if str(row.get("pid")) in relevant]
+        selected: set[int] = set()
+        for index in indexes:
+            selected.update(range(max(0, index - 1), min(len(rows), index + 2)))
+        if not selected:
+            selected.update(range(max(0, len(rows) - 6), len(rows)))
+        ordered = sorted(selected)
+        # Eight entries are enough to see the exchange without flooding the prompt.
+        context: list[dict] = []
+        for index in ordered[:8]:
+            row = rows[index]
+            current_pid = str(row.get("pid"))
+            role = ("incoming" if current_pid == str(incoming_pid)
+                    else "own" if current_pid == str(quote_pid) and row.get("author_id") == str(uid)
+                    else "quoted" if current_pid == str(quote_pid)
+                    else "parent" if current_pid == str(parent) else "floor")
+            context.append({"pid": current_pid, "floor": row.get("floor", ""),
+                            "author": row.get("author", ""), "role": role,
+                            "content": row.get("content", ""), "images": len(row.get("images") or [])})
+        return context
+
     async def _image_summary(self, *, title: str, body: str, images) -> str:
         analyzer = getattr(self.engine, "analyzer", None)
         if not images or not analyzer or not hasattr(analyzer, "analyze_images"):
@@ -309,12 +343,19 @@ class ManualActions:
             incoming_image_summary = await self._image_summary(
                 title=thread["title"], body=incoming_text,
                 images=actual_incoming.get("images") or [])
+            quote_pid = str(item.get("quote_pid") or "")
+            floor_context = self._reply_floor_context(thread, item, pid, uid, quote_pid, parent, known)
+            logger.info("[cyber-life] 贴吧识图材料 tid=%s incoming_pid=%s main_images=%s context_images=%s target_images=%s floor_context=%s",
+                        tid, pid, len(thread.get("images") or []),
+                        len(self._reply_context_images(thread, item, parent, known)),
+                        len(actual_incoming.get("images") or []), len(floor_context))
             return {"key": key, "thread": thread, "target": target, "incoming": item,
                     "material": {"platform": "tieba", "title": thread["title"], "content": thread["body"],
                                  "image_summary": body_image_summary,
                                  "incoming": incoming_text, "author": item["author"],
                                  "context_image_summary": context_image_summary,
                                  "incoming_image_summary": incoming_image_summary,
+                                 "floor_context": floor_context,
                                  "incoming_is_notification_preview": not bool(actual_incoming.get("content")),
                                  "own_comment": own.get("content") or known.get("body", ""),
                                  "notification_quote_unverified": item["quote_content"],

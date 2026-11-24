@@ -198,6 +198,12 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(material["image_summary"], self.thread["body"])
         self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")
         self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
+        self.assertEqual([row["pid"] for row in material["floor_context"]],
+                         ["102", "103", "104"])
+        self.assertEqual(material["floor_context"][0]["role"], "own")
+        self.assertEqual(material["floor_context"][1]["role"], "incoming")
+        self.assertTrue(all(isinstance(row["images"], int) and row["images"] >= 0
+                            for row in material["floor_context"]))
 
     async def test_tieba_reply_fetches_current_floor_and_target_by_pid(self):
         self.prepare_reply()
