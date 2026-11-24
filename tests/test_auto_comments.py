@@ -147,6 +147,21 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(insight.summary, "一只大肥鱼")
         self.assertEqual(insight.source, "vision")
 
+    async def test_tieba_images_are_cached_across_calls(self):
+        self.llm = types.SimpleNamespace(
+            available=True,
+            complete_json=AsyncMock(return_value={"summary": "一只大肥鱼"}),
+        )
+        analyzer = VideoAnalyzer(self.settings, self.llm, self.root)
+        first = await analyzer.analyze_images(title="看图", body="帮我看看",
+                                              images=["http://tiebapic.baidu.com/a.jpg"])
+        second = await analyzer.analyze_images(title="看图", body="帮我看看",
+                                               images=["https://tiebapic.baidu.com/a.jpg"])
+        self.llm.complete_json.assert_awaited_once()
+        self.assertFalse(first.cached)
+        self.assertTrue(second.cached)
+        self.assertEqual(second.summary, "一只大肥鱼")
+
     async def test_tieba_comment_material_includes_image_summary(self):
         self.engine.analyzer = types.SimpleNamespace(analyze_images=AsyncMock(
             return_value=VideoInsight(ok=True, summary="一只大肥鱼")))
@@ -155,7 +170,7 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(preview["material"]["image_summary"], "一只大肥鱼")
         self.assertNotIn("images", preview["material"])
 
-    async def test_tieba_reply_only_reads_body_and_target_comment_images(self):
+    async def test_tieba_reply_reads_body_context_and_target_images(self):
         self.prepare_reply()
         async def describe_images(*, title, body, images):
             return VideoInsight(ok=True, summary=body or title, frames=len(images))
@@ -170,12 +185,14 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
              "content": "别的楼层", "images": ["https://tiebapic.baidu.com/other.jpg"]},
         ]
         await self.engine.tick()
-        self.assertEqual(self.engine.analyzer.analyze_images.await_count, 2)
+        self.assertEqual(self.engine.analyzer.analyze_images.await_count, 3)
         self.assertEqual([call.kwargs["images"] for call in self.engine.analyzer.analyze_images.await_args_list],
                          [["https://tiebapic.baidu.com/body.jpg"],
+                          ["https://tiebapic.baidu.com/own.jpg", "https://tiebapic.baidu.com/target.jpg"],
                           ["https://tiebapic.baidu.com/target.jpg"]])
         material = self.writer.draft.await_args.kwargs["material"]
         self.assertEqual(material["image_summary"], self.thread["body"])
+        self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")
         self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
 
     async def test_writer_failure_keeps_quota_and_records_reason(self):

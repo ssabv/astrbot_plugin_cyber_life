@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,7 +17,7 @@ from .montage import compose_video
 from .platforms.base import Post
 from .tieba_actions import public_image_url
 from .transcribe import Transcript, Transcriber
-from .util import shorten
+from .util import atomic_write_json, read_json, shorten
 
 
 @dataclass
@@ -34,6 +37,7 @@ class VideoInsight:
     transcript_language: str = ""
     transcript_segments: int = 0
     transcript_error: str = ""
+    cached: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -91,6 +95,11 @@ class VideoAnalyzer:
         self.videos_dir.mkdir(parents=True, exist_ok=True)
         self.sheets_dir.mkdir(parents=True, exist_ok=True)
         self.transcriber = Transcriber(settings, data_dir)
+        self._vision_cache_path = data_dir / "media" / "vision-cache.json"
+        raw_cache = read_json(self._vision_cache_path, {})
+        self._vision_cache: dict[str, dict[str, Any]] = (
+            raw_cache.get("entries", {}) if isinstance(raw_cache, dict) else {}
+        )
 
     # --------------------------------------------------------------- public
     async def analyze(self, post: Post, platform: Any) -> VideoInsight:
@@ -225,6 +234,25 @@ class VideoAnalyzer:
             '{"summary":"100字以内的图片和正文概括","topics":["主题1","主题2"],'
             '"sentiment":-1到1的小数,"comment_hint":"如果要在评论区留一句自然、具体、不空洞的话，可以说什么"}'
         )
+        cache_key = hashlib.sha256(json.dumps(
+            {"title": title, "body": text, "images": urls},
+            ensure_ascii=False, sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        cached = self._vision_cache.get(cache_key) or {}
+        if isinstance(cached, dict) and cached.get("summary"):
+            topics = cached.get("topics") or []
+            insight = VideoInsight(
+                ok=True,
+                summary=shorten(str(cached.get("summary") or title), 240),
+                topics=[str(item)[:24] for item in topics if str(item).strip()][:6],
+                sentiment=float(cached.get("sentiment") or 0.0),
+                comment_hint=shorten(str(cached.get("comment_hint") or ""), 120),
+                frames=len(urls),
+                source="vision",
+                cached=True,
+            )
+            logger.info("[cyber-life] 贴吧图片识别命中缓存")
+            return insight
         try:
             data = await self.llm.complete_json(
                 prompt,
@@ -252,6 +280,17 @@ class VideoAnalyzer:
         except (TypeError, ValueError):
             insight.sentiment = 0.0
         insight.comment_hint = shorten(str(data.get("comment_hint") or ""), 120)
+        self._vision_cache[cache_key] = {
+            "summary": insight.summary,
+            "topics": insight.topics,
+            "sentiment": insight.sentiment,
+            "comment_hint": insight.comment_hint,
+            "frames": insight.frames,
+            "created_at": time.time(),
+        }
+        if len(self._vision_cache) > 200:
+            self._vision_cache = dict(list(self._vision_cache.items())[-200:])
+        atomic_write_json(self._vision_cache_path, {"version": 1, "entries": self._vision_cache})
         return insight
 
     async def transcript_bilibili_url(self, url: str, platform: Any) -> tuple[Post, Transcript]:

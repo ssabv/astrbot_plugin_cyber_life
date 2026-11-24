@@ -190,6 +190,17 @@ class ManualActions:
         return [job for job in self.jobs.values() if job.get("ok") and job.get("uid") == uid
                 and job.get("thread", {}).get("tid") == tid]
 
+    def _reply_context_images(self, thread: dict, item: dict, parent: str, known: dict) -> list[str]:
+        """Collect images from the quoted floor or its original parent floor."""
+        images: list[str] = []
+        rows = {str(row.get("pid", "")): row for row in thread.get("posts", []) if positive(row.get("pid"))}
+        for pid in (item.get("quote_pid"), parent, (known.get("target") or {}).get("parent_pid")):
+            row = rows.get(str(pid or ""))
+            for url in (row or {}).get("images") or []:
+                if url and url not in images:
+                    images.append(url)
+        return images[:3]
+
     async def _image_summary(self, *, title: str, body: str, images) -> str:
         analyzer = getattr(self.engine, "analyzer", None)
         if not images or not analyzer or not hasattr(analyzer, "analyze_images"):
@@ -272,6 +283,10 @@ class ManualActions:
             incoming_text = actual_incoming.get("content") or item["content"]
             body_image_summary = await self._image_summary(
                 title=thread["title"], body=thread["body"], images=thread.get("images") or [])
+            context_image_summary = await self._image_summary(
+                title=thread["title"],
+                body="\n".join(filter(None, (own.get("content"), incoming_text))),
+                images=self._reply_context_images(thread, item, parent, known))
             incoming_image_summary = await self._image_summary(
                 title=thread["title"], body=incoming_text,
                 images=actual_incoming.get("images") or [])
@@ -279,6 +294,7 @@ class ManualActions:
                     "material": {"platform": "tieba", "title": thread["title"], "content": thread["body"],
                                  "image_summary": body_image_summary,
                                  "incoming": incoming_text, "author": item["author"],
+                                 "context_image_summary": context_image_summary,
                                  "incoming_image_summary": incoming_image_summary,
                                  "incoming_is_notification_preview": not bool(actual_incoming.get("content")),
                                  "own_comment": own.get("content") or known.get("body", ""),
