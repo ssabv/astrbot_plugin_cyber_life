@@ -312,17 +312,34 @@ def parse_floor_comments(payload: bytes, *, limit: int = 8) -> list[dict]:
             continue
         author = message(item, 7)
         text_parts = []
+        image_parts = []
         for fragment_no, fragment_wire, fragment_value in item:
             if fragment_no != 2 or fragment_wire != 2:
                 continue
             fragment = fields(fragment_value)
             if str(integer(fragment, 1)) in {"0", "4"}:
                 text_parts.append(string(fragment, 2))
+            for field_no, field_wire, field_value in fragment:
+                if field_wire != 2:
+                    continue
+                try:
+                    candidate = public_image_url(field_value.decode("utf-8"))
+                except UnicodeDecodeError:
+                    continue
+                path = urlsplit(candidate).path.lower()
+                if not candidate or not path.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+                    continue
+                if "/tb/editor/images/" in path and "image_emoticon" in path:
+                    continue
+                if candidate not in image_parts:
+                    image_parts.append(candidate)
+            if len(image_parts) >= 3:
+                break
         rows.append({"pid": pid, "floor": str(integer(item, 6)),
                      "author_id": str(integer(author, 2) or integer(item, 4)),
                      "author": string(author, 4) or string(author, 3),
                      "portrait": string(author, 5),
-                     "content": "".join(text_parts)[:12000]})
+                     "content": "".join(text_parts)[:12000], "images": image_parts})
         if len(rows) >= max(1, min(limit, 20)):
             break
     return rows
@@ -474,7 +491,10 @@ class TiebaSession:
                            + pb_int(4, 1) + pb_bytes(9, common))
         raw = await self._request("https://tiebac.baidu.com/c/f/pb/floor?cmd=302002", multipart=payload)
         try:
-            return parse_floor_comments(raw, limit=limit)
+            rows = parse_floor_comments(raw, limit=limit)
+            for row in rows:
+                row["parent_pid"] = parent_pid
+            return rows
         except (ValueError, UnicodeError):
             raise TiebaActionError("贴吧楼中楼接口格式无法识别，本次不发送") from None
 

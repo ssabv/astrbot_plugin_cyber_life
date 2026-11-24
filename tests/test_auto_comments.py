@@ -10,7 +10,7 @@ from core.activity import ActivityEngine
 from core.manual_actions import ManualActions
 from core.platforms.base import Post
 from core.settings import SettingsStore
-from core.tieba_actions import TiebaActionError
+from core.tieba_actions import TiebaActionError, parse_floor_comments, pb_bytes, pb_int, pb_str
 from core.tieba_actions import image_urls
 from core.video_analysis import VideoAnalyzer, VideoInsight
 from core.writer import DraftResult
@@ -248,6 +248,37 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         material = self.writer.draft.await_args.kwargs["material"]
         self.assertEqual(material["same_floor_comments"],
                          [{"author": "路人", "content": "我也这么觉得"}])
+
+    async def test_tieba_floor_comments_parse_target_images(self):
+        author = pb_int(2, 88) + pb_str(4, "路人") + pb_str(5, "tb.1.author")
+        text = pb_int(1, 0) + pb_str(2, "看这个")
+        image = pb_int(1, 2) + pb_str(4, "http://tiebapic.baidu.com/forum/a.jpg")
+        item = (pb_int(1, 105) + pb_int(6, 64) + pb_bytes(7, author)
+                + pb_bytes(2, text) + pb_bytes(2, image))
+        payload = pb_bytes(1, pb_int(1, 0) + pb_str(2, "")) + pb_bytes(2, pb_bytes(4, item))
+        rows = parse_floor_comments(payload)
+        self.assertEqual(rows, [{"pid": "105", "floor": "64", "author_id": "88",
+                                 "author": "路人", "portrait": "tb.1.author",
+                                 "content": "看这个",
+                                 "images": ["https://tiebapic.baidu.com/forum/a.jpg"]}])
+
+    async def test_tieba_subcomment_reply_reads_target_image_from_floor_comments(self):
+        self.prepare_reply()
+        self.incoming.update({"pid": "105", "is_floor": True})
+        self.session.floor_comments = AsyncMock(return_value=[
+            {"pid": "105", "author_id": "99", "author": "群友", "content": "看这个",
+             "images": ["https://tiebapic.baidu.com/target.jpg"]},
+        ])
+        self.engine.analyzer = types.SimpleNamespace(analyze_images=AsyncMock(
+            return_value=VideoInsight(ok=True, summary="target")))
+
+        await self.engine.tick()
+
+        self.session.floor_comments.assert_awaited_once_with("123", "102", limit=8)
+        self.assertEqual(self.engine.analyzer.analyze_images.await_args.kwargs["images"],
+                         ["https://tiebapic.baidu.com/target.jpg"])
+        self.assertEqual(self.writer.draft.await_args.kwargs["material"]["incoming_image_summary"],
+                         "target")
 
     async def test_writer_failure_keeps_quota_and_records_reason(self):
         self.writer.draft.return_value = DraftResult(error="TimeoutError")

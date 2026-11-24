@@ -285,6 +285,7 @@ class ManualActions:
         except Exception as exc:  # noqa: BLE001
             logger.info("[cyber-life] 主帖楼层读取失败 tid=%s error_type=%s", tid, type(exc).__name__)
         anchors = {quote_pid, parent, str((known.get("target") or {}).get("parent_pid") or "")}
+        context_parent = ""
         for anchor in sorted(anchors):
             if not positive(anchor) or anchor in rows:
                 continue
@@ -298,15 +299,30 @@ class ManualActions:
                 if positive(extra_pid) and extra_pid not in rows:
                     thread.setdefault("posts", []).append(row)
                     rows[extra_pid] = row
+            # A lzl anchor may point at the bot's previous sub-comment; Tieba
+            # returns its containing floor in that response.
+            if (anchor == quote_pid and item.get("is_floor") and parent == quote_pid
+                    and quote_pid not in rows):
+                candidates = [row for row in extra.get("posts", [])
+                              if positive(row.get("pid")) and str(row.get("pid")) != quote_pid
+                              and str(row.get("floor", "")) != "1"]
+                if len(candidates) == 1:
+                    context_parent = str(candidates[0]["pid"])
+        if positive(context_parent):
+            thread["context_parent_pid"] = context_parent
         own = next((row for row in thread.get("posts", [])
                     if row["pid"] == quote_pid and row.get("author_id") == uid), {})
         reader = getattr(session, "floor_comments", None)
-        if item.get("is_floor") and positive(parent) and callable(reader):
+        context_parent = str(thread.get("context_parent_pid") or parent)
+        if item.get("is_floor") and positive(context_parent) and callable(reader):
             try:
-                comments = await reader(tid, parent, limit=8)
-                if rows.get(parent) is not None:
-                    rows[parent]["comments"] = comments
+                comments = await reader(tid, context_parent, limit=8)
+                if rows.get(context_parent) is not None:
+                    rows[context_parent]["comments"] = comments
                 thread["floor_comments"] = comments
+                if not own:
+                    own = next((row for row in comments
+                                if row.get("pid") == quote_pid and row.get("author_id") == uid), {})
             except Exception as exc:  # noqa: BLE001
                 logger.info("[cyber-life] 同楼层评论读取失败 parent=%s error_type=%s", parent, type(exc).__name__)
         return thread, own, known, parent
@@ -368,23 +384,27 @@ class ManualActions:
                 skipped.append("楼中楼缺少作者信息")
                 continue
             actual_incoming = next((row for row in thread["posts"] if row["pid"] == pid and row["author_id"] == item["author_id"]), {})
+            if not actual_incoming:
+                actual_incoming = next((row for row in thread.get("floor_comments") or []
+                                        if row.get("pid") == pid and row.get("author_id") == item["author_id"]), {})
             incoming_text = actual_incoming.get("content") or item["content"]
+            context_parent = str(thread.get("context_parent_pid") or parent)
             body_image_summary = await self._image_summary(
                 title=thread["title"], body=thread["body"], images=thread.get("images") or [])
             context_image_summary = await self._image_summary(
                 title=thread["title"],
                 body="\n".join(filter(None, (own.get("content"), incoming_text))),
-                images=self._reply_context_images(thread, item, parent, known))
+                images=self._reply_context_images(thread, item, context_parent, known))
             incoming_image_summary = await self._image_summary(
                 title=thread["title"], body=incoming_text,
                 images=actual_incoming.get("images") or [])
             quote_pid = str(item.get("quote_pid") or "")
-            floor_context = self._reply_floor_context(thread, item, pid, uid, quote_pid, parent, known)
+            floor_context = self._reply_floor_context(thread, item, pid, uid, quote_pid, context_parent, known)
             same_floor_comments = self._same_floor_comments(
-                thread, parent, {str(pid), quote_pid})
+                thread, context_parent, {str(pid), quote_pid})
             logger.info("[cyber-life] 贴吧识图材料 tid=%s incoming_pid=%s main_images=%s context_images=%s target_images=%s floor_context=%s same_floor_comments=%s",
                         tid, pid, len(thread.get("images") or []),
-                        len(self._reply_context_images(thread, item, parent, known)),
+                        len(self._reply_context_images(thread, item, context_parent, known)),
                         len(actual_incoming.get("images") or []),
                         len(floor_context), len(same_floor_comments))
             return {"key": key, "thread": thread, "target": target, "incoming": item,
