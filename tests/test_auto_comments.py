@@ -195,6 +195,31 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")
         self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
 
+    async def test_tieba_reply_fetches_current_floor_and_target_by_pid(self):
+        self.prepare_reply()
+        current = {"pid": "103", "floor": "48", "author_id": "99", "author": "别人",
+                   "content": "是啊还有一堆", "images": ["https://tiebapic.baidu.com/target.jpg"]}
+        current_floor = {"pid": "102", "floor": "2", "author_id": "42", "author": "群友",
+                         "content": "还没忙完啊", "images": ["https://tiebapic.baidu.com/floor2.jpg"]}
+        calls = []
+
+        async def read_thread(tid, anchor=""):
+            calls.append(anchor)
+            return {**self.thread, "posts": [current] if anchor == "103" else (
+                [current_floor] if anchor == "102" else [])}
+
+        self.session.thread = AsyncMock(side_effect=read_thread)
+        async def describe_images(*, title, body, images):
+            return VideoInsight(ok=True, summary=body or title, frames=len(images))
+        self.engine.analyzer = types.SimpleNamespace(analyze_images=AsyncMock(side_effect=describe_images))
+
+        await self.engine.tick()
+
+        self.assertEqual(calls, ["103", "102"])
+        material = self.writer.draft.await_args.kwargs["material"]
+        self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
+        self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")
+
     async def test_writer_failure_keeps_quota_and_records_reason(self):
         self.writer.draft.return_value = DraftResult(error="TimeoutError")
         await self.engine.tick()

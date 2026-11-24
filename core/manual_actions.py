@@ -212,6 +212,36 @@ class ManualActions:
             logger.info("[cyber-life] 贴吧图片识别跳过 error_type=%s", type(exc).__name__)
             return ""
 
+    async def _reply_thread_with_context(self, session, item: dict, records: list[dict], uid: str) -> tuple[dict, dict, dict, str]:
+        """Read the incoming floor and only the quoted/current floors it needs."""
+        tid, pid = item["tid"], item["pid"]
+        thread = await session.thread(tid, anchor=pid)
+        rows = {str(row.get("pid", "")): row for row in thread.get("posts", []) if positive(row.get("pid"))}
+        quote_pid = str(item.get("quote_pid") or "")
+        own = rows.get(quote_pid) if rows.get(quote_pid, {}).get("author_id") == uid else {}
+        known = next((job for job in records if job.get("sent_pid") == quote_pid), {})
+        parent = pid
+        if item.get("is_floor"):
+            parent = ((known.get("target") or {}).get("parent_pid")
+                      or (quote_pid if (own or known or item.get("quote_user_id")) else ""))
+        anchors = {quote_pid, parent, str((known.get("target") or {}).get("parent_pid") or "")}
+        for anchor in sorted(anchors):
+            if not positive(anchor) or anchor in rows:
+                continue
+            try:
+                extra = await session.thread(tid, anchor=anchor)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("[cyber-life] 补充楼层读取失败 anchor=%s error_type=%s", anchor, type(exc).__name__)
+                continue
+            for row in extra.get("posts", []):
+                extra_pid = str(row.get("pid", ""))
+                if positive(extra_pid) and extra_pid not in rows:
+                    thread.setdefault("posts", []).append(row)
+                    rows[extra_pid] = row
+        own = next((row for row in thread.get("posts", [])
+                    if row["pid"] == quote_pid and row.get("author_id") == uid), {})
+        return thread, own, known, parent
+
     async def prepare(self, session, kind, uid):
         allowed = self.scope()
         skipped = []
@@ -252,27 +282,16 @@ class ManualActions:
                 continue
             if not 0 <= time.time() - item["created_at"] <= 7 * 86400:
                 continue
-            thread = await session.thread(tid, anchor=item["quote_pid"] if positive(item["quote_pid"]) else "")
+            records = self.own_records(uid, tid)
+            thread, own, known, parent = await self._reply_thread_with_context(session, item, records, uid)
             if not forum_allowed(thread["forum"], allowed) or not thread["title"]:
                 continue
-            records = self.own_records(uid, tid)
-            own = next((row for row in thread["posts"] if row["pid"] == item["quote_pid"] and row["author_id"] == uid), {})
-            known = next((job for job in records if job.get("sent_pid") == item["quote_pid"]), {})
             if item["quote_user_id"] != uid and item["thread_author_id"] != uid and not own and not known:
                 skipped.append("无法核对消息是否回复本账号")
                 continue
-            parent = pid
-            if item["is_floor"]:
-                # A reply notification carries the quoted post's pid.  When
-                # that post was written by this account (quote_user_id), the
-                # pid is already the parent floor even if the read API did
-                # not return floor posts for this page.
-                parent = ((known.get("target") or {}).get("parent_pid")
-                          or (item["quote_pid"]
-                              if (own or known or item["quote_user_id"] == uid) else ""))
-                if not positive(parent):
-                    skipped.append("楼中楼的父楼无法定位")
-                    continue
+            if item["is_floor"] and not positive(parent):
+                skipped.append("楼中楼的父楼无法定位")
+                continue
             target = {"parent_pid": parent, "sub_pid": pid if item["is_floor"] else "",
                       "author_id": item["author_id"], "author": item["author"], "portrait": item["portrait"],
                       "content": item["content"], "quote_content": item.get("quote_content") or ""}
