@@ -127,6 +127,7 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
             {"type": "2", "src": "//imgsrc.baidu.com/forum/b.jpg"},
             {"type": "2", "cdn_src": "https://tiebapic.baidu.com/forum/c.jpg"},
             {"type": "2", "big_cdn_src": "https://tiebapic.baidu.com/forum/d.jpg"},
+            {"type": "3", "big_pic": "https://tiebapic.baidu.com/forum/e.jpg"},
             {"type": "2", "src": "http://localhost/secret"},
             {"type": "2", "src": "http://user:pass@tiebapic.baidu.com/leak.jpg"},
             {"type": "2", "src": "https://static.tieba.baidu.com/tb/editor/images/client/image_emoticon1.png"},
@@ -135,7 +136,8 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(urls, ["https://tiebapic.baidu.com/forum/a.jpg?size=1",
                                 "https://imgsrc.baidu.com/forum/b.jpg",
                                 "https://tiebapic.baidu.com/forum/c.jpg",
-                                "https://tiebapic.baidu.com/forum/d.jpg"])
+                                "https://tiebapic.baidu.com/forum/d.jpg",
+                                "https://tiebapic.baidu.com/forum/e.jpg"])
 
     async def test_tieba_images_are_described_by_vision_provider(self):
         self.llm = types.SimpleNamespace(

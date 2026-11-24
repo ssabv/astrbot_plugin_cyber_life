@@ -136,7 +136,11 @@ def image_urls(value) -> list[str]:
         return []
     result = []
     for item in value[:100]:
-        if not isinstance(item, dict) or (str(item.get("type", "2")) != "2" and "origin_src" not in item):
+        has_image_field = any(key in item for key in (
+            "origin_src", "big_src", "big_cdn_src", "cdn_src", "src", "c",
+            "big_pic", "small_pic", "origin_pic", "pic_url",
+        )) if isinstance(item, dict) else False
+        if not isinstance(item, dict) or (str(item.get("type", "2")) not in {"2", "3"} and not has_image_field):
             continue
         raw = str(item.get("origin_src") or item.get("big_src") or item.get("big_cdn_src")
                   or item.get("cdn_src") or item.get("src") or item.get("c")
@@ -529,10 +533,9 @@ class TiebaSession:
         origin = thread.get("origin_thread_info") or {}
         main = next((row for row in posts if row["floor"] == "1"), {})
         body = text_content(origin.get("content")) or main.get("content", "")
-        images = image_urls(origin.get("content"))
-        for url in main.get("images", []):
-            if url and url not in images and len(images) < 6:
-                images.append(url)
+        images = image_urls(origin.get("content")) + image_urls(origin.get("media")) + main.get("images", [])
+        images = list(dict.fromkeys(url for url in images if url))
+        images = images[:6]
         return {"tid": tid, "title": str(thread.get("title") or origin.get("title") or ""),
                 "body": text_content(origin.get("content")) or main.get("content", ""),
                 "images": images,
