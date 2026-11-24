@@ -59,7 +59,7 @@ from .core.takeover import TakeoverError
 from .core.tieba_scope import is_post_url
 
 PLUGIN_NAME = "astrbot_plugin_cyber_life"
-VERSION = "1.3.1-gemini.69"
+VERSION = "1.3.1-gemini.71"
 
 HELP = """\
 🌿 赛博日常 · 内置浏览器
@@ -2166,6 +2166,7 @@ class CyberLifePlugin(Star):
         try:
             return json_response(await self.manual_actions.preview(kind))
         except Exception as exc:
+            logger.warning("[cyber-life] preview kind=%s error=%r", kind, exc)
             return error_response(str(exc) if isinstance(exc, TiebaActionError) else type(exc).__name__, status_code=400)
 
     async def api_browser_remove_old_shell(self):

@@ -371,7 +371,7 @@ class ManualActions:
             floor_context = self._reply_floor_context(thread, item, pid, uid, quote_pid, parent, known)
             same_floor_comments = self._same_floor_comments(
                 thread, parent, {str(pid), quote_pid})
-            logger.info("[cyber-life] 贴吧识图材料 tid=%s incoming_pid=%s main_images=%s context_images=%s target_images=%s floor_context=%s",
+            logger.info("[cyber-life] 贴吧识图材料 tid=%s incoming_pid=%s main_images=%s context_images=%s target_images=%s floor_context=%s same_floor_comments=%s",
                         tid, pid, len(thread.get("images") or []),
                         len(self._reply_context_images(thread, item, parent, known)),
                         len(actual_incoming.get("images") or []),
