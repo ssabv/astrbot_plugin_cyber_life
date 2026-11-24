@@ -143,6 +143,9 @@ def image_urls(value) -> list[str]:
                   or item.get("big_pic") or item.get("small_pic") or item.get("origin_pic")
                   or item.get("pic_url") or "")
         url = public_image_url(raw)
+        path = urlsplit(url).path.lower()
+        if url and "/tb/editor/images/" in path and "image_emoticon" in path:
+            continue
         if url and url not in result:
             result.append(url)
         if len(result) >= 6:
@@ -526,7 +529,10 @@ class TiebaSession:
         origin = thread.get("origin_thread_info") or {}
         main = next((row for row in posts if row["floor"] == "1"), {})
         body = text_content(origin.get("content")) or main.get("content", "")
-        images = image_urls(origin.get("content")) or main.get("images", [])
+        images = image_urls(origin.get("content"))
+        for url in main.get("images", []):
+            if url and url not in images and len(images) < 6:
+                images.append(url)
         return {"tid": tid, "title": str(thread.get("title") or origin.get("title") or ""),
                 "body": text_content(origin.get("content")) or main.get("content", ""),
                 "images": images,

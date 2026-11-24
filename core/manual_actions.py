@@ -237,8 +237,10 @@ class ManualActions:
 
     def _same_floor_comments(self, thread: dict, parent: str, exclude: set[str], limit: int = 5) -> list[dict]:
         """Summarize other replies inside the target floor without raw media URLs."""
-        rows = {str(row.get("pid", "")): row for row in thread.get("posts", []) if positive(row.get("pid"))}
-        comments = (rows.get(str(parent or "")) or {}).get("comments") or []
+        comments = thread.get("floor_comments") or []
+        if not comments:
+            rows = {str(row.get("pid", "")): row for row in thread.get("posts", []) if positive(row.get("pid"))}
+            comments = (rows.get(str(parent or "")) or {}).get("comments") or []
         result = []
         for row in comments:
             pid = str(row.get("pid", ""))
@@ -273,6 +275,15 @@ class ManualActions:
         if item.get("is_floor"):
             parent = ((known.get("target") or {}).get("parent_pid")
                       or (quote_pid if (own or known or item.get("quote_user_id")) else ""))
+        try:
+            full = await session.thread(tid)
+            for row in full.get("posts", []):
+                row_pid = str(row.get("pid", ""))
+                if positive(row_pid) and row_pid not in rows:
+                    thread.setdefault("posts", []).append(row)
+                    rows[row_pid] = row
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[cyber-life] 主帖楼层读取失败 tid=%s error_type=%s", tid, type(exc).__name__)
         anchors = {quote_pid, parent, str((known.get("target") or {}).get("parent_pid") or "")}
         for anchor in sorted(anchors):
             if not positive(anchor) or anchor in rows:

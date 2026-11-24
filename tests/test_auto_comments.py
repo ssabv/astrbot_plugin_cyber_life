@@ -129,6 +129,7 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
             {"type": "2", "big_cdn_src": "https://tiebapic.baidu.com/forum/d.jpg"},
             {"type": "2", "src": "http://localhost/secret"},
             {"type": "2", "src": "http://user:pass@tiebapic.baidu.com/leak.jpg"},
+            {"type": "2", "src": "https://static.tieba.baidu.com/tb/editor/images/client/image_emoticon1.png"},
         ] * 3
         urls = image_urls(content)
         self.assertEqual(urls, ["https://tiebapic.baidu.com/forum/a.jpg?size=1",
@@ -225,7 +226,7 @@ class AutomaticTiebaCommentTests(unittest.IsolatedAsyncioTestCase):
 
         await self.engine.tick()
 
-        self.assertEqual(calls, ["103", "102"])
+        self.assertEqual(calls, ["103", "", "102"])
         material = self.writer.draft.await_args.kwargs["material"]
         self.assertEqual(material["incoming_image_summary"], "是啊还有一堆")
         self.assertEqual(material["context_image_summary"], "还没忙完啊\n是啊还有一堆")

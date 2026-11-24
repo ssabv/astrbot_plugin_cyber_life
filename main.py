@@ -59,7 +59,7 @@ from .core.takeover import TakeoverError
 from .core.tieba_scope import is_post_url
 
 PLUGIN_NAME = "astrbot_plugin_cyber_life"
-VERSION = "1.3.1-gemini.71"
+VERSION = "1.3.1-gemini.73"
 
 HELP = """\
 🌿 赛博日常 · 内置浏览器
