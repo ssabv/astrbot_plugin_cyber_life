@@ -284,6 +284,25 @@ class ManualActions:
                     rows[row_pid] = row
         except Exception as exc:  # noqa: BLE001
             logger.info("[cyber-life] 主帖楼层读取失败 tid=%s error_type=%s", tid, type(exc).__name__)
+        if positive(pid) and pid not in rows:
+            try:
+                reply_num = int(thread.get("reply_num") or 0)
+            except (TypeError, ValueError):
+                reply_num = 0
+            page_count = max(1, min(10, (reply_num + 29) // 30))
+            for page in range(2, page_count + 1):
+                try:
+                    paged = await session.thread(tid, page=page)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("[cyber-life] 主帖分页读取失败 tid=%s page=%s error_type=%s", tid, page, type(exc).__name__)
+                    continue
+                for row in paged.get("posts", []):
+                    row_pid = str(row.get("pid", ""))
+                    if positive(row_pid) and row_pid not in rows:
+                        thread.setdefault("posts", []).append(row)
+                        rows[row_pid] = row
+                if pid in rows:
+                    break
         anchors = {quote_pid, parent, str((known.get("target") or {}).get("parent_pid") or "")}
         context_parent = ""
         for anchor in sorted(anchors):

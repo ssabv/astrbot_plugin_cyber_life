@@ -59,7 +59,7 @@ from .core.takeover import TakeoverError
 from .core.tieba_scope import is_post_url
 
 PLUGIN_NAME = "astrbot_plugin_cyber_life"
-VERSION = "1.3.1-gemini.75"
+VERSION = "1.3.1-gemini.76"
 
 HELP = """\
 🌿 赛博日常 · 内置浏览器
@@ -2094,16 +2094,19 @@ class CyberLifePlugin(Star):
             return error_response("请先登录贴吧", status_code=400)
         try:
             async with TiebaSession(self.browser, account.name) as session:
-                thread = await session.thread(tid, anchor=anchor)
+                pn = int(str(request.query.get("pn") or "0")) if str(request.query.get("pn") or "0").isdigit() else 0
+                thread = await session.thread(tid, anchor=anchor, page=pn)
         except Exception as exc:  # noqa: BLE001
             return error_response(str(exc), status_code=400)
         posts = [{
             "pid": row.get("pid"), "floor": row.get("floor"),
             "author_id": row.get("author_id"), "author": row.get("author"),
             "content": str(row.get("content") or "")[:160],
+            "images": row.get("images") or [],
         } for row in thread.get("posts", [])]
         return json_response({"tid": tid, "anchor": anchor,
                               "title": thread.get("title"), "forum": thread.get("forum"),
+                              "images": thread.get("images") or [],
                               "posts": posts})
 
     async def api_tieba_inbox_preview(self):

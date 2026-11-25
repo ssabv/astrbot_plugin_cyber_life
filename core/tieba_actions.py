@@ -525,10 +525,10 @@ class TiebaSession:
         return sorted(candidates.values(), key=lambda row: (row["created_at"], int(row["tid"])),
                       reverse=True)[:max(1, min(limit, 30))]
 
-    async def thread(self, tid: str, *, anchor: str = "") -> dict:
+    async def thread(self, tid: str, *, anchor: str = "", page: int = 0) -> dict:
         if not positive(tid) or (anchor and not positive(anchor)):
             raise TiebaActionError("帖子编号无效")
-        params = {"kz": tid, "pn": "1", "rn": "30"}
+        params = {"kz": tid, "pn": str(max(1, page) if page else 1), "rn": "30"}
         if anchor:
             params["pid"] = anchor
         raw = await self.api("/c/f/pb/page", params)
@@ -561,7 +561,8 @@ class TiebaSession:
                 "images": images,
                 "forum": str(thread.get("forum_name") or thread.get("fname") or forum.get("name") or ""),
                 "fid": str(thread.get("fid") or thread.get("forum_id") or forum.get("id") or ""),
-                "author_id": str(thread.get("author_id") or main.get("author_id") or ""), "posts": posts,
+                "author_id": str(thread.get("author_id") or main.get("author_id") or ""),
+                "reply_num": str(thread.get("reply_num") or len(posts) or ""), "posts": posts,
                 "url": "https://tieba.baidu.com/p/" + tid}
 
     async def submit(self, thread: dict, body: str, uid: str, allowed: list[str], target: dict | None = None, *, pre_send=None) -> str:
